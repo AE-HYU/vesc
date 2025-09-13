@@ -179,7 +179,6 @@ private:
     void servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo_msg) {last_servo_cmd_ = servo_msg;}
     
     void predict(double dt, double kinematic_yaw_rate);
-    void updateYawRate(double measured_yaw_rate);
     void updateIMU(double measured_yaw_angle, double measured_yaw_rate, double v_linear);
 
     void publishOdometry(const rclcpp::Time& stamp);
