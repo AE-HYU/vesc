@@ -108,10 +108,18 @@
 #include "vesc_msgs/msg/vesc_state_stamped.hpp"
 #include "vesc_msgs/msg/vesc_imu_stamped.hpp"
 
+using Vector6d = Eigen::Matrix<double, 6, 1>;
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
+
+namespace vesc_ackermann
+{
+
 class VescToOdom : public rclcpp::Node
 {
 public:
-    VescToOdom();
+    // 컴포넌트 생성자 (필수)
+    explicit VescToOdom(const rclcpp::NodeOptions& options);
+
 
 private:
     // General Parameters
@@ -136,8 +144,8 @@ private:
     double q_x_, q_y_, q_yaw_, q_yaw_rate_, q_vx_, q_vy_; // process noise variances
 
     // State
-    Eigen::Vector6d x_; // state vector [x, y, yaw, yaw_rate]
-    Eigen::Matrix6d P_; // stste covariance [x, y, yaw, yaw_rate]
+    Vector6d x_; // state vector [x, y, yaw, yaw_rate]
+    Matrix6d P_; // state covariance [x, y, yaw, yaw_rate]
     Eigen::Matrix3d R_; // measurement noise variances [yaw_angle, yaw_rate]
     rclcpp::Time last_time_;
 
@@ -177,5 +185,7 @@ private:
     void publishOdometry(const rclcpp::Time& stamp);
     double normalize_angle(double angle);
 };
+
+}  // namespace vesc_ackermann
 
 #endif // VESC_TO_ODOM_HPP

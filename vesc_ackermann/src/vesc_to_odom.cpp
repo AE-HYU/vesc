@@ -202,21 +202,23 @@
 #include <tf2/utils.h>
 
 #include "vesc_ackermann/vesc_to_odom.hpp"
+namespace vesc_ackermann
+{
 
-VescToOdom::VescToOdom() : Node("vesc_to_odom_node")
+VescToOdom::VescToOdom(const rclcpp::NodeOptions& options) : rclcpp::Node("vesc_to_odom_node", options)
 {
     // Initialize parameters
     setParams();
 
     // Subscriptions
     vesc_state_sub_ = this->create_subscription<vesc_msgs::msg::VescStateStamped>(
-        "sensors/core", 10, std::bind(&EKFOdom::vescCallback, this, std::placeholders::_1));
+        "sensors/core", 10, std::bind(&VescToOdom::vescCallback, this, std::placeholders::_1));
     imu_sub_ = this->create_subscription<vesc_msgs::msg::VescImuStamped>(
-        "sensors/imu", 10, std::bind(&EKFOdom::imuCallback, this, std::placeholders::_1));
+        "sensors/imu", 10, std::bind(&VescToOdom::imuCallback, this, std::placeholders::_1));
     if (use_servo_cmd_)
     {
         servo_cmd_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "sensors/servo_position_command", 10, std::bind(&EKFOdom::servoCmdCallback, this, std::placeholders::_1));
+            "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, std::placeholders::_1));
     }
 
     // Publisher
@@ -234,7 +236,7 @@ VescToOdom::VescToOdom() : Node("vesc_to_odom_node")
 
     // EKF timer
     ekf_timer_ = this->create_wall_timer(
-        std::chrono::duration<double>(1.0 / ekf_timer_period_), std::bind(&EKFOdom::ekfTimerCallback, this));
+        std::chrono::duration<double>(1.0 / ekf_timer_period_), std::bind(&VescToOdom::ekfTimerCallback, this));
 }
 
 void VescToOdom::setParams()
@@ -252,10 +254,10 @@ void VescToOdom::setParams()
     this->declare_parameter("use_servo_cmd", true);
     this->get_parameter("use_servo_cmd", use_servo_cmd_);
 
-    this->declare_parameter("publish_tf", false);
+    this->declare_parameter("publish_tf", true);
     this->get_parameter("publish_tf", publish_tf_);
 
-    this->declare_parameter("update_imu", false);
+    this->declare_parameter("update_imu", true);
     this->get_parameter("update_imu", update_imu_);
 
     // Kinematic Parameters
@@ -357,43 +359,79 @@ void VescToOdom::ekfTimerCallback()
 
     double measured_yaw_rate = 0.0;
     double measured_yaw_angle= 0.0;
-    try
-    {
-        geometry_msgs::msg::TransformStamped imu_to_base_tf =
-            tf_buffer_->lookupTransform(base_frame_, imu_frame_, tf2::TimePointZero);
+    // try
+    // {
+    //     geometry_msgs::msg::TransformStamped imu_to_base_tf =
+    //         tf_buffer_->lookupTransform(base_frame_, imu_frame_, tf2::TimePointZero);
         
-        // Transform Angular Velocity
-        geometry_msgs::msg::Vector3 imu_angular_vel;
-        imu_angular_vel.x = imu_copy->imu.angular_velocity.x;
-        imu_angular_vel.y = imu_copy->imu.angular_velocity.y;
-        imu_angular_vel.z = imu_copy->imu.angular_velocity.z;
+    //     // Transform Angular Velocity
+    //     geometry_msgs::msg::Vector3 imu_angular_vel;
+    //     imu_angular_vel.x = imu_copy->imu.angular_velocity.x;
+    //     imu_angular_vel.y = imu_copy->imu.angular_velocity.y;
+    //     imu_angular_vel.z = imu_copy->imu.angular_velocity.z;
 
-        geometry_msgs::msg::Vector3 transformed_angular_vel;
-        tf2::doTransform(imu_angular_vel, transformed_angular_vel, imu_to_base_tf);
+    //     geometry_msgs::msg::Vector3 transformed_angular_vel;
+    //     tf2::doTransform(imu_angular_vel, transformed_angular_vel, imu_to_base_tf);
 
-        if (std::fabs(transformed_angular_vel.z) > 1.0)
-            measured_yaw_rate = transformed_angular_vel.z * M_PI / 180;
+    //     if (std::fabs(transformed_angular_vel.z) > 1.0)
+    //         measured_yaw_rate = transformed_angular_vel.z * M_PI / 180;
 
-        // Transform Orientation
-        geometry_msgs::msg::Quaternion imu_orientation = imu_copy->imu.orientation;
-        geometry_msgs::msg::Quaternion transformed_orientation;
-        tf2::doTransform(imu_orientation, transformed_orientation, imu_to_base_tf);
+    //     // Transform Orientation
+    //     geometry_msgs::msg::Quaternion imu_orientation = imu_copy->imu.orientation;
+    //     geometry_msgs::msg::Quaternion transformed_orientation;
+    //     tf2::doTransform(imu_orientation, transformed_orientation, imu_to_base_tf);
 
-        measured_yaw_angle = tf2::getYaw(transformed_orientation);
+    //     measured_yaw_angle = tf2::getYaw(transformed_orientation);
 
-        if (std::isnan(initial_imu_yaw_))
-        {
-            initial_imu_yaw_ = measured_yaw_angle;
-            RCLCPP_INFO(this->get_logger(), "Initial IMU Yaw Set: %f rad", initial_imu_yaw_);
-        }
-        measured_yaw_angle = normalize_angle(measured_yaw_angle - initial_imu_yaw_);
-    }
-    catch (tf2::TransformException &ex)
+    //     if (std::isnan(initial_imu_yaw_))
+    //     {
+    //         initial_imu_yaw_ = measured_yaw_angle;
+    //         RCLCPP_INFO(this->get_logger(), "Initial IMU Yaw Set: %f rad", initial_imu_yaw_);
+    //     }
+    //     measured_yaw_angle = normalize_angle(measured_yaw_angle - initial_imu_yaw_);
+    // }
+    // catch (tf2::TransformException &ex)
+    // {
+    //     RCLCPP_WARN(this->get_logger(), "Failed to get transform from %s to %s: %s",
+    //                 imu_frame_.c_str(), base_frame_.c_str(), ex.what());
+    //     return;
+    // }
+    geometry_msgs::msg::TransformStamped imu_to_base_tf;
+    imu_to_base_tf.header.frame_id = base_frame_;
+    imu_to_base_tf.child_frame_id = imu_frame_;
+
+    imu_to_base_tf.transform.translation.x = 0.20;
+    imu_to_base_tf.transform.translation.y = 0.0;
+    imu_to_base_tf.transform.translation.z = 0.07; 
+    imu_to_base_tf.transform.rotation.x = 0.0;
+    imu_to_base_tf.transform.rotation.y = 0.0;
+    imu_to_base_tf.transform.rotation.z = sqrt(2) / 2;
+    imu_to_base_tf.transform.rotation.w = sqrt(2) / 2;
+
+    geometry_msgs::msg::Vector3 imu_angular_vel;
+    imu_angular_vel.x = imu_copy->imu.angular_velocity.x;
+    imu_angular_vel.y = imu_copy->imu.angular_velocity.y;
+    imu_angular_vel.z = imu_copy->imu.angular_velocity.z;
+
+    geometry_msgs::msg::Vector3 transformed_angular_vel;
+    tf2::doTransform(imu_angular_vel, transformed_angular_vel, imu_to_base_tf);
+
+    if (std::fabs(transformed_angular_vel.z) > 1.0)
+        measured_yaw_rate = transformed_angular_vel.z * M_PI / 180;
+
+    // Transform Orientation
+    geometry_msgs::msg::Quaternion imu_orientation = imu_copy->imu.orientation;
+    geometry_msgs::msg::Quaternion transformed_orientation;
+    tf2::doTransform(imu_orientation, transformed_orientation, imu_to_base_tf);
+
+    measured_yaw_angle = tf2::getYaw(transformed_orientation);
+
+    if (std::isnan(initial_imu_yaw_))
     {
-        RCLCPP_WARN(this->get_logger(), "Failed to get transform from %s to %s: %s",
-                    imu_frame_.c_str(), base_frame_.c_str(), ex.what());
-        return;
+        initial_imu_yaw_ = measured_yaw_angle;
+
     }
+    measured_yaw_angle = normalize_angle(measured_yaw_angle - initial_imu_yaw_);
 
     if (!update_imu_)
     {
@@ -414,7 +452,7 @@ void VescToOdom::predict(double dt, double kinematic_yaw_rate)
     double current_yaw = x_(2);
     double current_yaw_rate = x_(3);
 
-    Eigen::Vector6d x_pred = x_;
+    Vector6d x_pred = x_;
     x_pred(0) += (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // x_new = x_old + v * cos(yaw) * dt
     x_pred(1) += (x_(4) * sin(current_yaw) + x_(5) * cos(current_yaw)) * dt; // y_new = y_old + v * sin(yaw) * dt
     x_pred(2) += current_yaw_rate * dt;            // yaw_new = yaw_old + yaw_rate * dt
@@ -422,7 +460,7 @@ void VescToOdom::predict(double dt, double kinematic_yaw_rate)
     x_pred(4) = x_(4);    // v_x
     x_pred(5) = x_(5);    // v_y
 
-    Eigen::Matrix6d F = Eigen::Matrix6d::Identity();
+    Matrix6d F = Matrix6d::Identity();
     F(0, 2) = -x_(4) * sin(current_yaw) * dt; // d(x_new)/d(yaw_old)
     F(1, 2) =  x_(4) * cos(current_yaw) * dt; // d(y_new)/d(yaw_old)
     F(2, 3) = dt;                             // d(yaw_new)/d(yaw_rate_old)
@@ -431,7 +469,7 @@ void VescToOdom::predict(double dt, double kinematic_yaw_rate)
     F(1, 4) = sin(current_yaw) * dt;          // d(y_new)/d(v_x)
     F(1, 5) = cos(current_yaw) * dt;
 
-    Eigen::Matrix6d Qd = Eigen::Matrix6d::Zero();
+    Matrix6d Qd = Matrix6d::Zero();
     Qd(0, 0) = q_x_ * dt * dt;        // Noise in X
     Qd(1, 1) = q_y_ * dt * dt;        // Noise in Y
     Qd(2, 2) = q_yaw_ * dt * dt;      // Noise in Yaw
@@ -445,23 +483,23 @@ void VescToOdom::predict(double dt, double kinematic_yaw_rate)
 
 void VescToOdom::updateYawRate(double measured_yaw_rate)
 {
-    Eigen::RowVector4d H;
-    H << 0, 0, 0, 1;
+    // Eigen::RowVector4d H;
+    // H << 0, 0, 0, 1;
 
-    Eigen::Matrix<double, 1, 1> z;
-    z << measured_yaw_rate;
+    // Eigen::Matrix<double, 1, 1> z;
+    // z << measured_yaw_rate;
 
-    Eigen::Matrix<double, 1, 1> y = z - H * x_;
+    // Eigen::Matrix<double, 1, 1> y = z - H * x_;
     
-    // Kalman Gain
-    Eigen::Matrix<double, 1, 1> R_yaw_rate_ = R_.block<1, 1>(1, 1);
+    // // Kalman Gain
+    // Eigen::Matrix<double, 1, 1> R_yaw_rate_ = R_.block<1, 1>(1, 1);
 
-    Eigen::Matrix<double, 1, 1> S = H * P_ * H.transpose() + R_yaw_rate_;
-    Eigen::Vector4d K = P_ * H.transpose() * S.inverse();
+    // Eigen::Matrix<double, 1, 1> S = H * P_ * H.transpose() + R_yaw_rate_;
+    // Eigen::Vector4d K = P_ * H.transpose() * S.inverse();
 
-    // Update state and covariance
-    x_ = x_ + K * y;
-    P_ = (Eigen::Matrix4d::Identity() - K * H) * P_;
+    // // Update state and covariance
+    // x_ = x_ + K * y;
+    // P_ = (Eigen::Matrix4d::Identity() - K * H) * P_;
 }
 
 void VescToOdom::updateIMU(double measured_yaw_angle, double measured_yaw_rate, double v_linear)
@@ -493,7 +531,7 @@ void VescToOdom::updateIMU(double measured_yaw_angle, double measured_yaw_rate, 
     x_(2) = normalize_angle(x_(2));
 
     // Update covariance
-    P_ = (Eigen::Matrix6d::Identity() - K * H) * P_;
+    P_ = (Matrix6d::Identity() - K * H) * P_;
 }
 
 void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
@@ -535,14 +573,17 @@ void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
     if (publish_tf_)
     {
         geometry_msgs::msg::TransformStamped tf;
-        tf.header.stamp = stamp;
         tf.header.frame_id = odom_frame_;
         tf.child_frame_id = base_frame_;
+        tf.header.stamp = this->now();  // Use current time like original code
         tf.transform.translation.x = x_(0);
         tf.transform.translation.y = x_(1);
         tf.transform.translation.z = 0.0;
         tf.transform.rotation = odom_msg.pose.pose.orientation;
-        tf_pub_->sendTransform(tf);
+
+        if (rclcpp::ok()) {
+            tf_pub_->sendTransform(tf);
+        }
     }
 }
 
@@ -553,3 +594,9 @@ double VescToOdom::normalize_angle(double angle)
         angle += 2.0 * M_PI;
     return angle - M_PI;
 }
+
+} // namespace vesc_ackermann
+
+#include "rclcpp_components/register_node_macro.hpp"  // NOLINT
+
+RCLCPP_COMPONENTS_REGISTER_NODE(vesc_ackermann::VescToOdom)
