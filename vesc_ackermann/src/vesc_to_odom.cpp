@@ -26,7 +26,7 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions& options) : rclcpp::Node("vesc_
     
     // Initialize EKF state and covariance
     x_.setZero();                   // Initial state vector [x, y, yaw, yaw_rate, vx, vy]
-    P_.setIdentity(); P_ *= 0.1;    // Initial covariance matrix
+    P_.setIdentity(); P_ *= 1e-6;    // Initial covariance matrix
     last_time_ = this->now();
 
     // Initialize TF Listener
@@ -294,9 +294,8 @@ void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
     // Set pose covariance
     odom_msg.pose.covariance[0] = P_(0,0);   // x variance
     odom_msg.pose.covariance[1] = P_(0,1);   // x-y covariance
-    odom_msg.pose.covariance[5] = P_(0,2);   // x-yaw covariance
     odom_msg.pose.covariance[7] = P_(1,1);   // y variance
-    odom_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
+    // odom_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
     odom_msg.pose.covariance[35] = P_(2,2);  // yaw variance
 
     // Set twist from state estimate
@@ -321,7 +320,7 @@ void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = odom_frame_;
         tf.child_frame_id = base_frame_;
-        tf.header.stamp = this->now();
+        tf.header.stamp = last_state_->header.stamp;
         tf.transform.translation.x = x_(0);
         tf.transform.translation.y = x_(1);
         tf.transform.translation.z = 0.0;
