@@ -110,6 +110,8 @@
 
 using Vector6d = Eigen::Matrix<double, 6, 1>;
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
+using Vector4d = Eigen::Matrix<double, 4, 1>;
+using Matrix4d = Eigen::Matrix<double, 4, 4>;
 
 namespace vesc_ackermann
 {
@@ -146,7 +148,7 @@ private:
     // State
     Vector6d x_; // state vector [x, y, yaw, yaw_rate]
     Matrix6d P_; // state covariance [x, y, yaw, yaw_rate]
-    Eigen::Matrix3d R_; // measurement noise variances [yaw_angle, yaw_rate]
+    Matrix4d R_; // measurement noise variances [yaw_angle, yaw_rate]
     rclcpp::Time last_time_;
 
     // ROS interfaces

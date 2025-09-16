@@ -91,16 +91,20 @@ void VescToOdom::setParams()
     this->get_parameter("Q.vy", q_vy_);
 
     // Measurement noise parameters (R matrix)
-    this->declare_parameter<double>("R.yaw_angle", 0.001);
-    this->get_parameter("R.yaw_angle", R_(0,0));
+    this->declare_parameter<double>("R.yaw", 0.001);
+    this->get_parameter("R.yaw", R_(0,0));
     this->declare_parameter<double>("R.yaw_rate", 0.001);
     this->get_parameter("R.yaw_rate", R_(1,1));
     this->declare_parameter<double>("R.vx", 0.001);
     this->get_parameter("R.vx", R_(2,2));
+    this->declare_parameter<double>("R.vy", 0.001);
+    this->get_parameter("R.vy", R_(3,3));
 
     // Initialize off-diagonal elements to zero
     R_(0,1) = 0.0; R_(1,0) = 0.0; R_(0,2) = 0.0;
     R_(2,0) = 0.0; R_(1,2) = 0.0; R_(2,1) = 0.0;
+    R_(0,3) = 0.0; R_(3,0) = 0.0; R_(1,3) = 0.0;
+    R_(3,1) = 0.0; R_(2,3) = 0.0; R_(3,2) = 0.0;
 }
 
 void VescToOdom::ekfTimerCallback()
@@ -140,11 +144,11 @@ void VescToOdom::ekfTimerCallback()
     {
         double clipped_servo = std::max(servo_min_, std::min(servo_copy->data, servo_max_));
         steer = (clipped_servo - steering_to_servo_offset_) / steering_to_servo_gain_;
-        kinematic_yaw_rate = v_linear * tan(steer) / wheelbase_;
+        // kinematic_yaw_rate = v_linear * tan(steer) / wheelbase_;
     }
 
     // EKF Prediction step
-    predict(dt, kinematic_yaw_rate);
+    predict(dt, steer);
 
     // Process IMU measurements
     double measured_yaw_rate = 0.0;
@@ -196,46 +200,53 @@ void VescToOdom::ekfTimerCallback()
     }
     else
     {
-        // Update EKF with yaw_angle, yaw_rate
-        updateIMU(measured_yaw_angle, measured_yaw_rate, v_linear);
+    // Measure EKF update time
+    auto t_start = std::chrono::steady_clock::now();
+    updateIMU(measured_yaw_angle, measured_yaw_rate, v_linear);
+    auto t_end = std::chrono::steady_clock::now();
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    RCLCPP_INFO(this->get_logger(), "EKF update duration: %ld us", duration_us);
     }
 
     // Publish the updated odometry
     publishOdometry(current_time);
 }
 
-void VescToOdom::predict(double dt, double kinematic_yaw_rate)
+void VescToOdom::predict(double dt, double steer)
 {
     double current_yaw = x_(2);
     double current_yaw_rate = x_(3);
+
+    RCLCPP_INFO(this->get_logger(), "Yaw for Prediction: %f, Cov(0,1): %f", current_yaw, P_(0,1));
 
     // Predict next state using kinematic model
     Vector6d x_pred = x_;
     x_pred(0) += (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // x position
     x_pred(1) += (x_(4) * sin(current_yaw) + x_(5) * cos(current_yaw)) * dt; // y position
     x_pred(2) += current_yaw_rate * dt;            // yaw angle
-    x_pred(3) = kinematic_yaw_rate;                // yaw rate from kinematics
+    x_pred(3) = x_(4) * tan(steer) / wheelbase_;   // yaw rate from kinematics
     x_pred(4) = x_(4);                             // vx (unchanged)
     x_pred(5) = x_(5);                             // vy (unchanged)
 
     // Jacobian matrix for state transition
     Matrix6d F = Matrix6d::Identity();
-    F(0, 2) = -x_(4) * sin(current_yaw) * dt; // dx/dyaw
-    F(1, 2) =  x_(4) * cos(current_yaw) * dt; // dy/dyaw
+    F(0, 2) = (-x_(4) * sin(current_yaw) - x_(5) * cos(current_yaw)) * dt; // dx/dyaw
+    F(1, 2) =  (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // dy/dyaw
     F(2, 3) = dt;                             // dyaw/dyaw_rate
     F(0, 4) = cos(current_yaw) * dt;          // dx/dvx
     F(0, 5) = -sin(current_yaw) * dt;         // dx/dvy
     F(1, 4) = sin(current_yaw) * dt;          // dy/dvx
     F(1, 5) = cos(current_yaw) * dt;          // dy/dvy
+    F(3, 4) = tan(steer) / wheelbase_;        // dyaw_rate/dvx
 
     // Process noise covariance matrix
     Matrix6d Qd = Matrix6d::Zero();
-    Qd(0, 0) = q_x_ * dt * dt;        // Position x noise
-    Qd(1, 1) = q_y_ * dt * dt;        // Position y noise
-    Qd(2, 2) = q_yaw_ * dt * dt;      // Yaw angle noise
-    Qd(3, 3) = q_yaw_rate_ * dt * dt; // Yaw rate noise
-    Qd(4, 4) = q_vx_ * dt * dt;       // Velocity x noise
-    Qd(5, 5) = q_vy_ * dt * dt;       // Velocity y noise
+    Qd(0, 0) = q_x_;        // Position x noise
+    Qd(1, 1) = q_y_;        // Position y noise
+    Qd(2, 2) = q_yaw_;      // Yaw angle noise
+    Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
+    Qd(4, 4) = q_vx_;       // Velocity x noise
+    Qd(5, 5) = q_vy_;       // Velocity y noise
 
     // Update state and covariance
     x_ = x_pred;
@@ -246,28 +257,29 @@ void VescToOdom::predict(double dt, double kinematic_yaw_rate)
 void VescToOdom::updateIMU(double measured_yaw_angle, double measured_yaw_rate, double v_linear)
 {
     // Measurement vector [yaw_angle, yaw_rate, velocity]
-    Eigen::Vector3d z;
-    z << measured_yaw_angle, measured_yaw_rate, v_linear;
+    Vector4d z;
+    z << measured_yaw_angle, measured_yaw_rate, v_linear, 0.0;
 
     // Expected measurement from current state
-    Eigen::Vector3d h_x_pred;
-    h_x_pred << x_(2), x_(3), x_(4);
+    Vector4d h_x_pred;
+    h_x_pred << x_(2), x_(3), x_(4), x_(5);
 
     // Innovation (measurement residual)
-    Eigen::Vector3d y = z - h_x_pred;
+    Vector4d y = z - h_x_pred;
     y(0) = normalize_angle(y(0)); // Normalize angle innovation
 
-    // Measurement Jacobian matrix H (3x6)
-    Eigen::Matrix<double, 3, 6> H;
+    // Measurement Jacobian matrix H (4x6)
+    Eigen::Matrix<double, 4, 6> H;
     H << 0, 0, 1, 0, 0, 0,  // yaw angle measurement
          0, 0, 0, 1, 0, 0,  // yaw rate measurement
-         0, 0, 0, 0, 1, 0;  // velocity measurement
+         0, 0, 0, 0, 1, 0,
+         0, 0, 0, 0, 0, 1;  // velocity measurement
 
     // Innovation covariance
-    Eigen::Matrix3d S = H * P_ * H.transpose() + R_;
+    Matrix4d S = H * P_ * H.transpose() + R_;
 
     // Kalman gain
-    Eigen::Matrix<double, 6, 3> K = P_ * H.transpose() * S.inverse();
+    Eigen::Matrix<double, 6, 4> K = P_ * H.transpose() * S.inverse();
 
     // Update state estimate
     x_ = x_ + K * y;
@@ -294,8 +306,12 @@ void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
     // Set pose covariance
     odom_msg.pose.covariance[0] = P_(0,0);   // x variance
     odom_msg.pose.covariance[1] = P_(0,1);   // x-y covariance
+    odom_msg.pose.covariance[5] = P_(0,2);   // x-yaw covariance
+    odom_msg.pose.covariance[6] = P_(1,0);   // y-x covariance
     odom_msg.pose.covariance[7] = P_(1,1);   // y variance
-    // odom_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
+    odom_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
+    odom_msg.pose.covariance[30] = P_(2,0);  // yaw-x covariance
+    odom_msg.pose.covariance[31] = P_(2,1);  // yaw-y covariance
     odom_msg.pose.covariance[35] = P_(2,2);  // yaw variance
 
     // Set twist from state estimate
