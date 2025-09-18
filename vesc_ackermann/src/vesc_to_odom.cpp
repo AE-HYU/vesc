@@ -267,18 +267,12 @@ void VescToOdom::predict(double dt, double steer)
 
     // Process noise covariance matrix
     Matrix6d Qd = Matrix6d::Zero();
-    // Qd(0, 0) = q_x_;        // Position x noise
-    // Qd(1, 1) = q_y_;        // Position y noise
-    // Qd(2, 2) = q_yaw_;     // Yaw angle noise
-    // Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
-    // Qd(4, 4) = q_vx_;      // Velocity x noise
-    // Qd(5, 5) = q_vy_;      // Velocity y noise
-    Qd(0, 0) = 1e-4 * x_(4) * x_(4) + 4 * 1e-4 * x_(4) + 4 * 1e-4;        // Position x noise
-    Qd(1, 1) = 1e-4 * x_(5) * x_(5) + 4 * 1e-4 * x_(5) + 4 * 1e-4;        // Position y noise
-    Qd(2, 2) = 1e-4;     // Yaw angle noise
-    Qd(3, 3) = 1e-4; // Yaw rate noise
-    Qd(4, 4) = 2e-3;      // Velocity x noise
-    Qd(5, 5) = 2e-3;      // Velocity y noise
+    Qd(0, 0) = q_x_;        // Position x noise
+    Qd(1, 1) = q_y_;        // Position y noise
+    Qd(2, 2) = q_yaw_;     // Yaw angle noise
+    Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
+    Qd(4, 4) = q_vx_;      // Velocity x noise
+    Qd(5, 5) = q_vy_;      // Velocity y noise
 
     RCLCPP_INFO(this->get_logger(), "Q matrix: %f, %f, %f, %f, %f, %f",
                 Qd(0,0), Qd(1,1), Qd(2,2), Qd(3,3), Qd(4,4), Qd(5,5));
