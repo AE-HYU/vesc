@@ -24,6 +24,9 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions& options) : rclcpp::Node("vesc_
     odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
     if (publish_tf_) tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
     
+    // Prediction covariance publisher for PlotJuggler using PoseWithCovarianceStamped
+    pred_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("ekf/pred_cov", 10);
+    
     // Initialize EKF state and covariance
     x_.setZero();                   // Initial state vector [x, y, yaw, yaw_rate, vx, vy]
     P_.setIdentity(); P_ *= 1e-6;    // Initial covariance matrix
@@ -127,6 +130,7 @@ void VescToOdom::ekfTimerCallback()
 
     rclcpp::Time current_time = now();
     double dt = (current_time - last_time_).seconds();
+    //RCLCPP_INFO(this->get_logger(), "EKF dt: %f", dt);
     if (dt <= 0.0)
     {
         RCLCPP_WARN(this->get_logger(), "dt is zero or negative. Skipping EKF update.");
@@ -149,6 +153,28 @@ void VescToOdom::ekfTimerCallback()
 
     // EKF Prediction step
     predict(dt, steer);
+
+    // Publish covariance after prediction for PlotJuggler
+    geometry_msgs::msg::PoseWithCovarianceStamped pred_cov_msg;
+    pred_cov_msg.header.stamp = current_time;
+    pred_cov_msg.header.frame_id = odom_frame_;
+    pred_cov_msg.pose.pose.position.x = x_(0);
+    pred_cov_msg.pose.pose.position.y = x_(1);
+    pred_cov_msg.pose.pose.orientation.z = sin(x_(2) / 2.0);
+    pred_cov_msg.pose.pose.orientation.w = cos(x_(2) / 2.0);
+    
+    // Set covariance matrix (6x6 -> 6x6, only pose part)
+    pred_cov_msg.pose.covariance[0] = P_(0,0);   // x variance
+    pred_cov_msg.pose.covariance[1] = P_(0,1);   // x-y covariance
+    pred_cov_msg.pose.covariance[5] = P_(0,2);   // x-yaw covariance
+    pred_cov_msg.pose.covariance[6] = P_(1,0);   // y-x covariance
+    pred_cov_msg.pose.covariance[7] = P_(1,1);   // y variance
+    pred_cov_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
+    pred_cov_msg.pose.covariance[30] = P_(2,0);  // yaw-x covariance
+    pred_cov_msg.pose.covariance[31] = P_(2,1);  // yaw-y covariance
+    pred_cov_msg.pose.covariance[35] = P_(2,2);  // yaw variance
+    
+    pred_cov_pub_->publish(pred_cov_msg);
 
     // Process IMU measurements
     double measured_yaw_rate = 0.0;
@@ -217,7 +243,7 @@ void VescToOdom::predict(double dt, double steer)
     double current_yaw = x_(2);
     double current_yaw_rate = x_(3);
 
-    RCLCPP_INFO(this->get_logger(), "Yaw for Prediction: %f, Cov(0,1): %f", current_yaw, P_(0,1));
+    //RCLCPP_INFO(this->get_logger(), "Yaw for Prediction: %f, Cov(0,1): %f", current_yaw, P_(0,1));
 
     // Predict next state using kinematic model
     Vector6d x_pred = x_;
@@ -241,12 +267,21 @@ void VescToOdom::predict(double dt, double steer)
 
     // Process noise covariance matrix
     Matrix6d Qd = Matrix6d::Zero();
-    Qd(0, 0) = q_x_;        // Position x noise
-    Qd(1, 1) = q_y_;        // Position y noise
-    Qd(2, 2) = q_yaw_;      // Yaw angle noise
-    Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
-    Qd(4, 4) = q_vx_;       // Velocity x noise
-    Qd(5, 5) = q_vy_;       // Velocity y noise
+    // Qd(0, 0) = q_x_;        // Position x noise
+    // Qd(1, 1) = q_y_;        // Position y noise
+    // Qd(2, 2) = q_yaw_;     // Yaw angle noise
+    // Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
+    // Qd(4, 4) = q_vx_;      // Velocity x noise
+    // Qd(5, 5) = q_vy_;      // Velocity y noise
+    Qd(0, 0) = 1e-4 * x_(4) * x_(4) + 4 * 1e-4 * x_(4) + 4 * 1e-4;        // Position x noise
+    Qd(1, 1) = 1e-4 * x_(5) * x_(5) + 4 * 1e-4 * x_(5) + 4 * 1e-4;        // Position y noise
+    Qd(2, 2) = 1e-4;     // Yaw angle noise
+    Qd(3, 3) = 1e-4; // Yaw rate noise
+    Qd(4, 4) = 2e-3;      // Velocity x noise
+    Qd(5, 5) = 2e-3;      // Velocity y noise
+
+    RCLCPP_INFO(this->get_logger(), "Q matrix: %f, %f, %f, %f, %f, %f",
+                Qd(0,0), Qd(1,1), Qd(2,2), Qd(3,3), Qd(4,4), Qd(5,5));
 
     // Update state and covariance
     x_ = x_pred;

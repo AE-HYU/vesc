@@ -98,6 +98,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "std_msgs/msg/float64.hpp"
 
 #include "tf2_ros/transform_broadcaster.h"
@@ -153,6 +154,7 @@ private:
 
     // ROS interfaces
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pred_cov_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
     rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
     rclcpp::Subscription<vesc_msgs::msg::VescImuStamped>::SharedPtr imu_sub_;
