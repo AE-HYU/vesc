@@ -72,6 +72,7 @@ private:
   double x_, y_, yaw_;
   Float64::SharedPtr last_servo_cmd_;  ///< Last servo position commanded value
   double last_imu_yaw_state_;    ///< Last yaw value from imu
+  double imu_yaw_rad;
   double last_imu_yaw_rate_state_;    ///< Last yaw rate value from imu
   bool imu_data_received_;  ///< Flag to track if IMU data has been received
   VescStateStamped::SharedPtr last_state_;  ///< Last received state message

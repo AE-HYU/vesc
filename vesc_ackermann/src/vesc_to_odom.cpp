@@ -129,6 +129,8 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
 void VescToOdom::imuCallback(const VescImuStamped::SharedPtr imu)
 {
   last_imu_yaw_state_ = -imu->imu.ypr.z;
+  imu_yaw_rad = last_imu_yaw_state_ * M_PI / 180.0;
+
   last_imu_yaw_rate_state_ = -imu->imu.angular_velocity.z;
   imu_data_received_ = true;
 }
@@ -145,7 +147,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   }
 
   // convert to engineering units
-  double current_speed = -(state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
+  double current_speed = (state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
   if (std::fabs(current_speed) < 0.05) {
     current_speed = 0.0;
   }
@@ -153,7 +155,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   double current_steering_angle(0.0), current_angular_velocity(0.0), yaw_rate_(0.0);
 
   if (use_imu_heading_) {
-    yaw_ = last_imu_yaw_state_;
+    yaw_ = imu_yaw_rad;
   }
   else if (use_servo_cmd_) {
     current_steering_angle =
