@@ -32,6 +32,7 @@
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
+#include <vesc_msgs/msg/vesc_imu_stamped.hpp>
 
 #include <cmath>
 #include <string>
@@ -44,29 +45,45 @@ using nav_msgs::msg::Odometry;
 using std::placeholders::_1;
 using std_msgs::msg::Float64;
 using vesc_msgs::msg::VescStateStamped;
+using vesc_msgs::msg::VescImuStamped;
 
 VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
 : Node("vesc_to_odom_node", options),
   odom_frame_("odom"),
   base_frame_("base_link"),
-  use_servo_cmd_(true),
+  use_servo_cmd_(false),
+  use_imu_heading_(true),
   publish_tf_(false),
   x_(0.0),
   y_(0.0),
-  yaw_(0.0)
+  yaw_(0.0),
+  last_imu_yaw_state_(0.0),
+  last_imu_yaw_rate_state_(0.0),
+  imu_data_received_(false)
 {
   // get ROS parameters
   odom_frame_ = declare_parameter("odom_frame", odom_frame_);
   base_frame_ = declare_parameter("base_frame", base_frame_);
   use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", use_servo_cmd_);
-  
+  use_imu_heading_ = declare_parameter("use_imu_heading", use_imu_heading_);
+
   declare_parameter<double>("speed_to_erpm_gain", 0.0);
   declare_parameter<double>("speed_to_erpm_offset", 0.0);
 
   speed_to_erpm_gain_ = get_parameter("speed_to_erpm_gain").get_value<double>();
   speed_to_erpm_offset_ = get_parameter("speed_to_erpm_offset").get_value<double>();
 
-  if (use_servo_cmd_) {
+  if (use_imu_heading_) {
+    RCLCPP_INFO(get_logger(), "Using IMU heading to calculate odometry");
+    
+    declare_parameter<double>("wheelbase", 0.324);
+    declare_parameter<double>("imu_offset_from_rear_axle", 0.2);
+    
+    wheelbase_ = get_parameter("wheelbase").get_value<double>();
+    imu_offset_from_rear_axle_ = get_parameter("imu_offset_from_rear_axle").get_value<double>();
+  } 
+  
+  else if (use_servo_cmd_) {
     declare_parameter<double>("steering_angle_to_servo_gain", 0.0);
     declare_parameter<double>("steering_angle_to_servo_offset", 0.0);
     declare_parameter<double>("wheelbase", 0.0);
@@ -74,6 +91,13 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
     steering_to_servo_gain_ = get_parameter("steering_angle_to_servo_gain").get_value<double>();
     steering_to_servo_offset_ = get_parameter("steering_angle_to_servo_offset").get_value<double>();
     wheelbase_ = get_parameter("wheelbase").get_value<double>();
+  }
+
+  else {
+    RCLCPP_WARN(
+      get_logger(),
+      "Not using servo commands or IMU heading to calculate angular velocity, odometry will be "
+      "purely linear");
   }
 
   publish_tf_ = declare_parameter("publish_tf", publish_tf_);
@@ -90,14 +114,31 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   vesc_state_sub_ = create_subscription<VescStateStamped>(
     "sensors/core", 10, std::bind(&VescToOdom::vescStateCallback, this, _1));
 
+  // subscribe to imu state
+  if (use_imu_heading_) {
+    imu_sub_ = create_subscription<VescImuStamped>(
+      "sensors/imu", 10, std::bind(&VescToOdom::imuCallback, this, _1));
+  }
+
   if (use_servo_cmd_) {
     servo_sub_ = create_subscription<Float64>(
       "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, _1));
   }
 }
 
+void VescToOdom::imuCallback(const VescImuStamped::SharedPtr imu)
+{
+  last_imu_yaw_state_ = -imu->imu.ypr.z;
+  last_imu_yaw_rate_state_ = -imu->imu.angular_velocity.z;
+  imu_data_received_ = true;
+}
+
 void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
+  // check that we have a last imu state if we are depending on it for heading
+  if (use_imu_heading_ && !imu_data_received_) {
+    return;
+  }
   // check that we have a last servo command if we are depending on it for angular velocity
   if (use_servo_cmd_ && !last_servo_cmd_) {
     return;
@@ -108,11 +149,19 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   if (std::fabs(current_speed) < 0.05) {
     current_speed = 0.0;
   }
-  double current_steering_angle(0.0), current_angular_velocity(0.0);
-  if (use_servo_cmd_) {
+
+  double current_steering_angle(0.0), current_angular_velocity(0.0), yaw_rate_(0.0);
+
+  if (use_imu_heading_) {
+    yaw_ = last_imu_yaw_state_;
+  }
+  else if (use_servo_cmd_) {
     current_steering_angle =
       (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
     current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
+  }
+  else {
+    current_angular_velocity = 0.0;
   }
 
   // use current state as last state if this is our first time here
