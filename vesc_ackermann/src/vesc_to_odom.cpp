@@ -23,9 +23,13 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions& options) : rclcpp::Node("vesc_
     // Publisher
     odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
     if (publish_tf_) tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
-    
+
     // Prediction covariance publisher for PlotJuggler using PoseWithCovarianceStamped
     pred_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("ekf/pred_cov", 10);
+
+    // Measurement publishers for EKF debugging
+    measured_yaw_rate_pub_ = this->create_publisher<std_msgs::msg::Float64>("ekf/measured_yaw_rate", 10);
+    measured_yaw_angle_pub_ = this->create_publisher<std_msgs::msg::Float64>("ekf/measured_yaw_angle", 10);
     
     // Initialize EKF state and covariance
     x_.setZero();                   // Initial state vector [x, y, yaw, yaw_rate, vx, vy]
@@ -52,7 +56,7 @@ void VescToOdom::setParams()
     this->get_parameter("imu_frame", imu_frame_);
 
     // Control parameters
-    this->declare_parameter("use_servo_cmd", true);
+    this->declare_parameter("use_servo_cmd", false);
     this->get_parameter("use_servo_cmd", use_servo_cmd_);
     this->declare_parameter("publish_tf", true);
     this->get_parameter("publish_tf", publish_tf_);
@@ -112,23 +116,23 @@ void VescToOdom::setParams()
 
 void VescToOdom::ekfTimerCallback()
 {
+    auto t_start = std::chrono::steady_clock::now();
+
     vesc_msgs::msg::VescStateStamped::SharedPtr state_copy;
     vesc_msgs::msg::VescImuStamped::SharedPtr imu_copy;
-    std_msgs::msg::Float64::SharedPtr servo_copy;
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
         state_copy = last_state_;
         imu_copy = last_imu_state_;
-        if (use_servo_cmd_) servo_copy = last_servo_cmd_;
     }
 
-    if (!state_copy || !imu_copy || (use_servo_cmd_ && !servo_copy))
+    if (!state_copy || !imu_copy)
     {
         RCLCPP_WARN(this->get_logger(), "EKF timer called but no data available yet.");
         return;
     }
 
-    rclcpp::Time current_time = now();
+    rclcpp::Time current_time = state_copy->header.stamp;
     double dt = (current_time - last_time_).seconds();
     //RCLCPP_INFO(this->get_logger(), "EKF dt: %f", dt);
     if (dt <= 0.0)
@@ -142,17 +146,10 @@ void VescToOdom::ekfTimerCallback()
     double v_linear = (state_copy->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
     if (std::fabs(v_linear) < 0.05) v_linear = 0.0;
 
-    // Calculate kinematic yaw rate from steering command
-    double steer = 0.0, kinematic_yaw_rate = 0.0;
-    if (use_servo_cmd_)
-    {
-        double clipped_servo = std::max(servo_min_, std::min(servo_copy->data, servo_max_));
-        steer = (clipped_servo - steering_to_servo_offset_) / steering_to_servo_gain_;
-        // kinematic_yaw_rate = v_linear * tan(steer) / wheelbase_;
-    }
+    // Steering command no longer used for yaw rate prediction
 
     // EKF Prediction step
-    predict(dt, steer);
+    predict(dt);
 
     // Publish covariance after prediction for PlotJuggler
     geometry_msgs::msg::PoseWithCovarianceStamped pred_cov_msg;
@@ -220,6 +217,15 @@ void VescToOdom::ekfTimerCallback()
     }
     measured_yaw_angle = normalize_angle(measured_yaw_angle - initial_imu_yaw_);
 
+    // Publish measured values for debugging
+    std_msgs::msg::Float64 yaw_rate_msg;
+    yaw_rate_msg.data = measured_yaw_rate;
+    measured_yaw_rate_pub_->publish(yaw_rate_msg);
+
+    std_msgs::msg::Float64 yaw_angle_msg;
+    yaw_angle_msg.data = measured_yaw_angle;
+    measured_yaw_angle_pub_->publish(yaw_angle_msg);
+
     if (!update_imu_)
     {
         // Skip IMU update - only use prediction
@@ -227,18 +233,17 @@ void VescToOdom::ekfTimerCallback()
     else
     {
     // Measure EKF update time
-    auto t_start = std::chrono::steady_clock::now();
     updateIMU(measured_yaw_angle, measured_yaw_rate, v_linear);
     auto t_end = std::chrono::steady_clock::now();
     auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-    RCLCPP_INFO(this->get_logger(), "EKF update duration: %ld us", duration_us);
+    RCLCPP_INFO(this->get_logger(), "EKF duration: %ld us", duration_us);
     }
 
     // Publish the updated odometry
     publishOdometry(current_time);
 }
 
-void VescToOdom::predict(double dt, double steer)
+void VescToOdom::predict(double dt)
 {
     double current_yaw = x_(2);
     double current_yaw_rate = x_(3);
@@ -250,7 +255,7 @@ void VescToOdom::predict(double dt, double steer)
     x_pred(0) += (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // x position
     x_pred(1) += (x_(4) * sin(current_yaw) + x_(5) * cos(current_yaw)) * dt; // y position
     x_pred(2) += current_yaw_rate * dt;            // yaw angle
-    x_pred(3) = x_(4) * tan(steer) / wheelbase_;   // yaw rate from kinematics
+    x_pred(3) = x_(3);                             // yaw rate (unchanged)
     x_pred(4) = x_(4);                             // vx (unchanged)
     x_pred(5) = x_(5);                             // vy (unchanged)
 
@@ -263,7 +268,7 @@ void VescToOdom::predict(double dt, double steer)
     F(0, 5) = -sin(current_yaw) * dt;         // dx/dvy
     F(1, 4) = sin(current_yaw) * dt;          // dy/dvx
     F(1, 5) = cos(current_yaw) * dt;          // dy/dvy
-    F(3, 4) = tan(steer) / wheelbase_;        // dyaw_rate/dvx
+    // F(3, 4) = tan(steer) / wheelbase_;        // dyaw_rate/dvx (removed)
 
     // Process noise covariance matrix
     Matrix6d Qd = Matrix6d::Zero();

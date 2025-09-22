@@ -155,6 +155,8 @@ private:
     // ROS interfaces
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pred_cov_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr measured_yaw_rate_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr measured_yaw_angle_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
     rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
     rclcpp::Subscription<vesc_msgs::msg::VescImuStamped>::SharedPtr imu_sub_;
@@ -182,7 +184,7 @@ private:
     void imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu_msg) {last_imu_state_ = imu_msg;}
     void servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo_msg) {last_servo_cmd_ = servo_msg;}
     
-    void predict(double dt, double kinematic_yaw_rate);
+    void predict(double dt);
     void updateIMU(double measured_yaw_angle, double measured_yaw_rate, double v_linear);
 
     void publishOdometry(const rclcpp::Time& stamp);
