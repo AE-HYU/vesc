@@ -370,7 +370,7 @@ void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
         geometry_msgs::msg::TransformStamped tf;
         tf.header.frame_id = odom_frame_;
         tf.child_frame_id = base_frame_;
-        tf.header.stamp = last_state_->header.stamp;
+        tf.header.stamp = stamp;
         tf.transform.translation.x = x_(0);
         tf.transform.translation.y = x_(1);
         tf.transform.translation.z = 0.0;
