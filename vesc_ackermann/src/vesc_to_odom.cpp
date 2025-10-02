@@ -1,397 +1,241 @@
-#include <tf2/utils.h>
+// Copyright 2020 F1TENTH Foundation
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//   * Redistributions of source code must retain the above copyright
+//     notice, this list of conditions and the following disclaimer.
+//
+//   * Redistributions in binary form must reproduce the above copyright
+//     notice, this list of conditions and the following disclaimer in the
+//     documentation and/or other materials provided with the distribution.
+//
+//   * Neither the name of the {copyright_holder} nor the names of its
+//     contributors may be used to endorse or promote products derived from
+//     this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+// -*- mode:c++; fill-column: 100; -*-
 
 #include "vesc_ackermann/vesc_to_odom.hpp"
+
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <vesc_msgs/msg/vesc_state_stamped.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+
+#include <cmath>
+#include <string>
+
 namespace vesc_ackermann
 {
 
-VescToOdom::VescToOdom(const rclcpp::NodeOptions& options) : rclcpp::Node("vesc_to_odom_node", options)
+using geometry_msgs::msg::TransformStamped;
+using nav_msgs::msg::Odometry;
+using std::placeholders::_1;
+using std_msgs::msg::Float64;
+using vesc_msgs::msg::VescStateStamped;
+
+VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
+: Node("vesc_to_odom_node", options),
+  odom_frame_("odom"),
+  base_frame_("base_link"),
+  use_servo_cmd_(true),
+  use_imu_(false),
+  publish_tf_(false),
+  x_(0.0),
+  y_(0.0),
+  yaw_(0.0)
 {
-    // Initialize parameters
-    setParams();
+  // get ROS parameters
+  odom_frame_ = declare_parameter("odom_frame", odom_frame_);
+  base_frame_ = declare_parameter("base_frame", base_frame_);
+  use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", use_servo_cmd_);
+  use_imu_ = declare_parameter("use_imu", use_imu_);
 
-    // Subscriptions
-    vesc_state_sub_ = this->create_subscription<vesc_msgs::msg::VescStateStamped>(
-        "sensors/core", 10, std::bind(&VescToOdom::vescCallback, this, std::placeholders::_1));
-    imu_sub_ = this->create_subscription<vesc_msgs::msg::VescImuStamped>(
-        "sensors/imu", 10, std::bind(&VescToOdom::imuCallback, this, std::placeholders::_1));
-    if (use_servo_cmd_)
-    {
-        servo_cmd_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, std::placeholders::_1));
-    }
+  declare_parameter<double>("speed_to_erpm_gain", 0.0);
+  declare_parameter<double>("speed_to_erpm_offset", 0.0);
 
-    // Publisher
-    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
-    if (publish_tf_) tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
+  speed_to_erpm_gain_ = get_parameter("speed_to_erpm_gain").get_value<double>();
+  speed_to_erpm_offset_ = get_parameter("speed_to_erpm_offset").get_value<double>();
 
-    // Prediction covariance publisher for PlotJuggler using PoseWithCovarianceStamped
-    pred_cov_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("ekf/pred_cov", 10);
+  if (use_servo_cmd_) {
+    declare_parameter<double>("steering_angle_to_servo_gain", 0.0);
+    declare_parameter<double>("steering_angle_to_servo_offset", 0.0);
+    declare_parameter<double>("wheelbase", 0.0);
 
-    // Measurement publishers for EKF debugging
-    measured_yaw_rate_pub_ = this->create_publisher<std_msgs::msg::Float64>("ekf/measured_yaw_rate", 10);
-    measured_yaw_angle_pub_ = this->create_publisher<std_msgs::msg::Float64>("ekf/measured_yaw_angle", 10);
-    
-    // Initialize EKF state and covariance
-    x_.setZero();                   // Initial state vector [x, y, yaw, yaw_rate, vx, vy]
-    P_.setIdentity(); P_ *= 1e-6;    // Initial covariance matrix
-    last_time_ = this->now();
+    steering_to_servo_gain_ = get_parameter("steering_angle_to_servo_gain").get_value<double>();
+    steering_to_servo_offset_ = get_parameter("steering_angle_to_servo_offset").get_value<double>();
+    wheelbase_ = get_parameter("wheelbase").get_value<double>();
+  }
 
-    // Initialize TF Listener
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+  publish_tf_ = declare_parameter("publish_tf", publish_tf_);
 
-    // EKF update timer
-    ekf_timer_ = this->create_wall_timer(
-        std::chrono::duration<double>(1.0 / ekf_timer_period_), std::bind(&VescToOdom::ekfTimerCallback, this));
-}
+  // Parameter validation
+  if (use_imu_ && use_servo_cmd_) {
+    RCLCPP_WARN(get_logger(),
+      "Both use_imu and use_servo_cmd are true. IMU will be used for angular velocity and yaw.");
+  }
 
-void VescToOdom::setParams()
-{
-    // Frame parameters
-    this->declare_parameter("odom_frame", "odom");
-    this->get_parameter("odom_frame", odom_frame_);
-    this->declare_parameter("base_frame", "base_link");
-    this->get_parameter("base_frame", base_frame_);
-    this->declare_parameter("imu_frame", "imu_link");
-    this->get_parameter("imu_frame", imu_frame_);
+  // create odom publisher
+  odom_pub_ = create_publisher<Odometry>("odom", 10);
 
-    // Control parameters
-    this->declare_parameter("use_servo_cmd", false);
-    this->get_parameter("use_servo_cmd", use_servo_cmd_);
-    this->declare_parameter("publish_tf", true);
-    this->get_parameter("publish_tf", publish_tf_);
-    this->declare_parameter("update_imu", true);
-    this->get_parameter("update_imu", update_imu_);
+  // create tf broadcaster
+  if (publish_tf_) {
+    tf_pub_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+  }
 
-    // Vehicle kinematic parameters
-    this->declare_parameter("speed_to_erpm_gain", 1.0);
-    this->get_parameter("speed_to_erpm_gain", speed_to_erpm_gain_);
-    this->declare_parameter("speed_to_erpm_offset", 0.0);
-    this->get_parameter("speed_to_erpm_offset", speed_to_erpm_offset_);
-    this->declare_parameter("steering_angle_to_servo_gain", 1.0);
-    this->get_parameter("steering_angle_to_servo_gain", steering_to_servo_gain_);
-    this->declare_parameter("steering_angle_to_servo_offset", 0.0);
-    this->get_parameter("steering_angle_to_servo_offset", steering_to_servo_offset_);
-    this->declare_parameter("wheelbase", 0.32);
-    this->get_parameter("wheelbase", wheelbase_);
-    this->declare_parameter("servo_min", 0.15);
-    this->get_parameter("servo_min", servo_min_);
-    this->declare_parameter("servo_max", 0.85);
-    this->get_parameter("servo_max", servo_max_);
+  // subscribe to vesc state and. optionally, servo command
+  vesc_state_sub_ = create_subscription<VescStateStamped>(
+    "sensors/core", 10, std::bind(&VescToOdom::vescStateCallback, this, _1));
 
-    // EKF timing parameter
-    this->declare_parameter<double>("ekf_timer_period", 50.0);
-    this->get_parameter("ekf_timer_period", ekf_timer_period_);
+  if (use_servo_cmd_) {
+    servo_sub_ = create_subscription<Float64>(
+      "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, _1));
+  }
 
-    // Process noise parameters (Q matrix)
-    this->declare_parameter<double>("Q.x", 1e-5);
-    this->get_parameter("Q.x", q_x_);
-    this->declare_parameter<double>("Q.y", 1e-5);
-    this->get_parameter("Q.y", q_y_);
-    this->declare_parameter<double>("Q.yaw", 1e-3);
-    this->get_parameter("Q.yaw", q_yaw_);
-    this->declare_parameter<double>("Q.yaw_rate", 1e-3);
-    this->get_parameter("Q.yaw_rate", q_yaw_rate_);
-    this->declare_parameter<double>("Q.vx", 1e-3);
-    this->get_parameter("Q.vx", q_vx_);
-    this->declare_parameter<double>("Q.vy", 1e-3);
-    this->get_parameter("Q.vy", q_vy_);
-
-    // Measurement noise parameters (R matrix)
-    this->declare_parameter<double>("R.yaw", 0.001);
-    this->get_parameter("R.yaw", R_(0,0));
-    this->declare_parameter<double>("R.yaw_rate", 0.001);
-    this->get_parameter("R.yaw_rate", R_(1,1));
-    this->declare_parameter<double>("R.vx", 0.001);
-    this->get_parameter("R.vx", R_(2,2));
-    this->declare_parameter<double>("R.vy", 0.001);
-    this->get_parameter("R.vy", R_(3,3));
-
-    // Initialize off-diagonal elements to zero
-    R_(0,1) = 0.0; R_(1,0) = 0.0; R_(0,2) = 0.0;
-    R_(2,0) = 0.0; R_(1,2) = 0.0; R_(2,1) = 0.0;
-    R_(0,3) = 0.0; R_(3,0) = 0.0; R_(1,3) = 0.0;
-    R_(3,1) = 0.0; R_(2,3) = 0.0; R_(3,2) = 0.0;
-}
-
-void VescToOdom::ekfTimerCallback()
-{
-    auto t_start = std::chrono::steady_clock::now();
-
-    vesc_msgs::msg::VescStateStamped::SharedPtr state_copy;
-    vesc_msgs::msg::VescImuStamped::SharedPtr imu_copy;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        state_copy = last_state_;
-        imu_copy = last_imu_state_;
-    }
-
-    if (!state_copy || !imu_copy)
-    {
-        RCLCPP_WARN(this->get_logger(), "EKF timer called but no data available yet.");
-        return;
-    }
-
-    rclcpp::Time current_time = state_copy->header.stamp;
-    double dt = (current_time - last_time_).seconds();
-    //RCLCPP_INFO(this->get_logger(), "EKF dt: %f", dt);
-    if (dt <= 0.0)
-    {
-        RCLCPP_WARN(this->get_logger(), "dt is zero or negative. Skipping EKF update.");
-        return;
-    }
-    last_time_ = current_time;
-
-    // Convert ERPM to linear velocity and apply deadband
-    double v_linear = (state_copy->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
-    if (std::fabs(v_linear) < 0.05) v_linear = 0.0;
-
-    // Steering command no longer used for yaw rate prediction
-
-    // EKF Prediction step
-    predict(dt);
-
-    // Publish covariance after prediction for PlotJuggler
-    geometry_msgs::msg::PoseWithCovarianceStamped pred_cov_msg;
-    pred_cov_msg.header.stamp = current_time;
-    pred_cov_msg.header.frame_id = odom_frame_;
-    pred_cov_msg.pose.pose.position.x = x_(0);
-    pred_cov_msg.pose.pose.position.y = x_(1);
-    pred_cov_msg.pose.pose.orientation.z = sin(x_(2) / 2.0);
-    pred_cov_msg.pose.pose.orientation.w = cos(x_(2) / 2.0);
-    
-    // Set covariance matrix (6x6 -> 6x6, only pose part)
-    pred_cov_msg.pose.covariance[0] = P_(0,0);   // x variance
-    pred_cov_msg.pose.covariance[1] = P_(0,1);   // x-y covariance
-    pred_cov_msg.pose.covariance[5] = P_(0,2);   // x-yaw covariance
-    pred_cov_msg.pose.covariance[6] = P_(1,0);   // y-x covariance
-    pred_cov_msg.pose.covariance[7] = P_(1,1);   // y variance
-    pred_cov_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
-    pred_cov_msg.pose.covariance[30] = P_(2,0);  // yaw-x covariance
-    pred_cov_msg.pose.covariance[31] = P_(2,1);  // yaw-y covariance
-    pred_cov_msg.pose.covariance[35] = P_(2,2);  // yaw variance
-    
-    pred_cov_pub_->publish(pred_cov_msg);
-
-    // Process IMU measurements
-    double measured_yaw_rate = 0.0;
-    double measured_yaw_angle = 0.0;
-    // Define static transform from IMU to base frame
-    geometry_msgs::msg::TransformStamped imu_to_base_tf;
-    imu_to_base_tf.header.frame_id = base_frame_;
-    imu_to_base_tf.child_frame_id = imu_frame_;
-    imu_to_base_tf.transform.translation.x = 0.20;
-    imu_to_base_tf.transform.translation.y = 0.0;
-    imu_to_base_tf.transform.translation.z = 0.07;
-    imu_to_base_tf.transform.rotation.x = 0.0;
-    imu_to_base_tf.transform.rotation.y = 0.0;
-    imu_to_base_tf.transform.rotation.z = 0.0;
-    imu_to_base_tf.transform.rotation.w = 1.0;
-
-    // Transform IMU angular velocity to base frame
-    geometry_msgs::msg::Vector3 imu_angular_vel;
-    imu_angular_vel.x = imu_copy->imu.angular_velocity.x;
-    imu_angular_vel.y = imu_copy->imu.angular_velocity.y;
-    imu_angular_vel.z = imu_copy->imu.angular_velocity.z;
-
-    geometry_msgs::msg::Vector3 transformed_angular_vel;
-    tf2::doTransform(imu_angular_vel, transformed_angular_vel, imu_to_base_tf);
-
-    // Use yaw rate measurement if above threshold
-    if (std::fabs(transformed_angular_vel.z) > 1.0)
-    {
-        measured_yaw_rate = transformed_angular_vel.z * M_PI / 180;
-    }
-
-    // Transform IMU orientation to base frame
-    geometry_msgs::msg::Quaternion imu_orientation = imu_copy->imu.orientation;
-    geometry_msgs::msg::Quaternion transformed_orientation;
-    tf2::doTransform(imu_orientation, transformed_orientation, imu_to_base_tf);
-
-    measured_yaw_angle = tf2::getYaw(transformed_orientation);
-
-    // Initialize reference yaw angle on first measurement
-    if (std::isnan(initial_imu_yaw_))
-    {
-        initial_imu_yaw_ = measured_yaw_angle;
-    }
-    measured_yaw_angle = normalize_angle(measured_yaw_angle - initial_imu_yaw_);
-
-    // Publish measured values for debugging
-    std_msgs::msg::Float64 yaw_rate_msg;
-    yaw_rate_msg.data = measured_yaw_rate;
-    measured_yaw_rate_pub_->publish(yaw_rate_msg);
-
-    std_msgs::msg::Float64 yaw_angle_msg;
-    yaw_angle_msg.data = measured_yaw_angle;
-    measured_yaw_angle_pub_->publish(yaw_angle_msg);
-
-    if (!update_imu_)
-    {
-        // Skip IMU update - only use prediction
-    }
-    else
-    {
-    // Measure EKF update time
-    updateIMU(measured_yaw_angle, measured_yaw_rate, v_linear);
-    auto t_end = std::chrono::steady_clock::now();
-    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-    RCLCPP_INFO(this->get_logger(), "EKF duration: %ld us", duration_us);
-    }
-
-    // Publish the updated odometry
-    publishOdometry(current_time);
-}
-
-void VescToOdom::predict(double dt)
-{
-    double current_yaw = x_(2);
-    double current_yaw_rate = x_(3);
-
-    //RCLCPP_INFO(this->get_logger(), "Yaw for Prediction: %f, Cov(0,1): %f", current_yaw, P_(0,1));
-
-    // Predict next state using kinematic model
-    Vector6d x_pred = x_;
-    x_pred(0) += (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // x position
-    x_pred(1) += (x_(4) * sin(current_yaw) + x_(5) * cos(current_yaw)) * dt; // y position
-    x_pred(2) += current_yaw_rate * dt;            // yaw angle
-    x_pred(3) = x_(3);                             // yaw rate (unchanged)
-    x_pred(4) = x_(4);                             // vx (unchanged)
-    x_pred(5) = x_(5);                             // vy (unchanged)
-
-    // Jacobian matrix for state transition
-    Matrix6d F = Matrix6d::Identity();
-    F(0, 2) = (-x_(4) * sin(current_yaw) - x_(5) * cos(current_yaw)) * dt; // dx/dyaw
-    F(1, 2) =  (x_(4) * cos(current_yaw) - x_(5) * sin(current_yaw)) * dt; // dy/dyaw
-    F(2, 3) = dt;                             // dyaw/dyaw_rate
-    F(0, 4) = cos(current_yaw) * dt;          // dx/dvx
-    F(0, 5) = -sin(current_yaw) * dt;         // dx/dvy
-    F(1, 4) = sin(current_yaw) * dt;          // dy/dvx
-    F(1, 5) = cos(current_yaw) * dt;          // dy/dvy
-    // F(3, 4) = tan(steer) / wheelbase_;        // dyaw_rate/dvx (removed)
-
-    // Process noise covariance matrix
-    Matrix6d Qd = Matrix6d::Zero();
-    Qd(0, 0) = q_x_;        // Position x noise
-    Qd(1, 1) = q_y_;        // Position y noise
-    Qd(2, 2) = q_yaw_;     // Yaw angle noise
-    Qd(3, 3) = q_yaw_rate_; // Yaw rate noise
-    Qd(4, 4) = q_vx_;      // Velocity x noise
-    Qd(5, 5) = q_vy_;      // Velocity y noise
-
-    RCLCPP_INFO(this->get_logger(), "Q matrix: %f, %f, %f, %f, %f, %f",
-                Qd(0,0), Qd(1,1), Qd(2,2), Qd(3,3), Qd(4,4), Qd(5,5));
-
-    // Update state and covariance
-    x_ = x_pred;
-    P_ = F * P_ * F.transpose() + Qd;
+  if (use_imu_) {
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      "sensors/imu/raw", 10, std::bind(&VescToOdom::imuCallback, this, _1));
+  }
 }
 
 
-void VescToOdom::updateIMU(double measured_yaw_angle, double measured_yaw_rate, double v_linear)
+void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
-    // Measurement vector [yaw_angle, yaw_rate, velocity]
-    Vector4d z;
-    z << measured_yaw_angle, measured_yaw_rate, v_linear, 0.0;
+  // check that we have a last servo command if we are depending on it for angular velocity
+  if (use_servo_cmd_ && !last_servo_cmd_) {
+    return;
+  }
 
-    // Expected measurement from current state
-    Vector4d h_x_pred;
-    h_x_pred << x_(2), x_(3), x_(4), x_(5);
+  // check that we have IMU data if we are using it
+  if (use_imu_ && !last_imu_) {
+    return;
+  }
 
-    // Innovation (measurement residual)
-    Vector4d y = z - h_x_pred;
-    y(0) = normalize_angle(y(0)); // Normalize angle innovation
+  // convert to engineering units
+  double current_speed = (state->state.speed - speed_to_erpm_offset_) / speed_to_erpm_gain_;
+  if (std::fabs(current_speed) < 0.05) {
+    current_speed = 0.0;
+  }
 
-    // Measurement Jacobian matrix H (4x6)
-    Eigen::Matrix<double, 4, 6> H;
-    H << 0, 0, 1, 0, 0, 0,  // yaw angle measurement
-         0, 0, 0, 1, 0, 0,  // yaw rate measurement
-         0, 0, 0, 0, 1, 0,
-         0, 0, 0, 0, 0, 1;  // velocity measurement
+  double current_angular_velocity = 0.0;
 
-    // Innovation covariance
-    Matrix4d S = H * P_ * H.transpose() + R_;
+  if (use_imu_) {
+    // Use IMU yaw rate (angular velocity around z-axis)
+    current_angular_velocity = last_imu_->angular_velocity.z;
+  } else if (use_servo_cmd_) {
+    // Calculate from steering angle
+    double current_steering_angle =
+      (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
+    current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
+  }
 
-    // Kalman gain
-    Eigen::Matrix<double, 6, 4> K = P_ * H.transpose() * S.inverse();
+  // use current state as last state if this is our first time here
+  if (!last_state_) {
+    last_state_ = state;
+  }
 
-    // Update state estimate
-    x_ = x_ + K * y;
-    x_(2) = normalize_angle(x_(2)); // Normalize yaw angle
+  // calc elapsed time
+  auto dt = rclcpp::Time(state->header.stamp) - rclcpp::Time(last_state_->header.stamp);
 
-    // Update covariance estimate
-    P_ = (Matrix6d::Identity() - K * H) * P_;
-}
+  /** @todo could probably do better propigating odometry, e.g. trapezoidal integration */
 
-void VescToOdom::publishOdometry(const rclcpp::Time& stamp)
-{
-    // Create odometry message
-    nav_msgs::msg::Odometry odom_msg;
-    odom_msg.header.stamp = stamp;
-    odom_msg.header.frame_id = odom_frame_;
-    odom_msg.child_frame_id = base_frame_;
+  // propigate odometry
+  double x_dot = current_speed * cos(yaw_);
+  double y_dot = current_speed * sin(yaw_);
+  x_ += x_dot * dt.seconds();
+  y_ += y_dot * dt.seconds();
 
-    // Set pose from state estimate
-    odom_msg.pose.pose.position.x = x_(0);
-    odom_msg.pose.pose.position.y = x_(1);
-    odom_msg.pose.pose.orientation.z = sin(x_(2) / 2.0);
-    odom_msg.pose.pose.orientation.w = cos(x_(2) / 2.0);
+  if (use_imu_) {
+    // Extract yaw from IMU quaternion
+    tf2::Quaternion q(
+      last_imu_->orientation.x,
+      last_imu_->orientation.y,
+      last_imu_->orientation.z,
+      last_imu_->orientation.w
+    );
+    tf2::Matrix3x3 m(q);
+    double roll, pitch;
+    m.getRPY(roll, pitch, yaw_);
+  } else {
+    yaw_ += current_angular_velocity * dt.seconds();
+  }
 
-    // Set pose covariance
-    odom_msg.pose.covariance[0] = P_(0,0);   // x variance
-    odom_msg.pose.covariance[1] = P_(0,1);   // x-y covariance
-    odom_msg.pose.covariance[5] = P_(0,2);   // x-yaw covariance
-    odom_msg.pose.covariance[6] = P_(1,0);   // y-x covariance
-    odom_msg.pose.covariance[7] = P_(1,1);   // y variance
-    odom_msg.pose.covariance[11] = P_(1,2);  // y-yaw covariance
-    odom_msg.pose.covariance[30] = P_(2,0);  // yaw-x covariance
-    odom_msg.pose.covariance[31] = P_(2,1);  // yaw-y covariance
-    odom_msg.pose.covariance[35] = P_(2,2);  // yaw variance
+  // save state for next time
+  last_state_ = state;
 
-    // Set twist from state estimate
-    odom_msg.twist.twist.linear.x = x_(4);
-    odom_msg.twist.twist.linear.y = x_(5);
-    odom_msg.twist.twist.angular.z = x_(3);
+  // publish odometry message
+  Odometry odom;
+  odom.header.frame_id = odom_frame_;
+  odom.header.stamp = state->header.stamp;
+  odom.child_frame_id = base_frame_;
 
-    // Set twist covariance
-    odom_msg.twist.covariance[0] = P_(4,4);   // vx variance
-    odom_msg.twist.covariance[1] = P_(4,5);   // vx-vy covariance
-    odom_msg.twist.covariance[5] = P_(4,3);   // vx-angular covariance
-    odom_msg.twist.covariance[7] = P_(5,5);   // vy variance
-    odom_msg.twist.covariance[11] = P_(5,3);  // vy-angular covariance
-    odom_msg.twist.covariance[35] = P_(3,3);  // angular variance
+  // Position
+  odom.pose.pose.position.x = x_;
+  odom.pose.pose.position.y = y_;
+  odom.pose.pose.orientation.x = 0.0;
+  odom.pose.pose.orientation.y = 0.0;
+  odom.pose.pose.orientation.z = sin(yaw_ / 2.0);
+  odom.pose.pose.orientation.w = cos(yaw_ / 2.0);
 
-    // Publish odometry message
-    odom_pub_->publish(odom_msg);
+  // Position uncertainty
+  /** @todo Think about position uncertainty, perhaps get from parameters? */
+  odom.pose.covariance[0] = 0.2;   ///< x
+  odom.pose.covariance[7] = 0.2;   ///< y
+  odom.pose.covariance[35] = 0.4;  ///< yaw
 
-    // Publish TF transform if enabled
-    if (publish_tf_)
-    {
-        geometry_msgs::msg::TransformStamped tf;
-        tf.header.frame_id = odom_frame_;
-        tf.child_frame_id = base_frame_;
-        tf.header.stamp = stamp;
-        tf.transform.translation.x = x_(0);
-        tf.transform.translation.y = x_(1);
-        tf.transform.translation.z = 0.0;
-        tf.transform.rotation = odom_msg.pose.pose.orientation;
+  // Velocity ("in the coordinate frame given by the child_frame_id")
+  odom.twist.twist.linear.x = current_speed;
+  odom.twist.twist.linear.y = 0.0;
+  odom.twist.twist.angular.z = current_angular_velocity;
 
-        if (rclcpp::ok()) {
-            tf_pub_->sendTransform(tf);
-        }
+  // Velocity uncertainty
+  /** @todo Think about velocity uncertainty */
+
+  if (publish_tf_) {
+    TransformStamped tf;
+    tf.header.frame_id = odom_frame_;
+    tf.child_frame_id = base_frame_;
+    tf.header.stamp = state->header.stamp;
+    tf.transform.translation.x = x_;
+    tf.transform.translation.y = y_;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation = odom.pose.pose.orientation;
+
+    if (rclcpp::ok()) {
+      tf_pub_->sendTransform(tf);
     }
+  }
+
+  if (rclcpp::ok()) {
+    odom_pub_->publish(odom);
+  }
 }
 
-double VescToOdom::normalize_angle(double angle)
+void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
 {
-    angle = fmod(angle + M_PI, 2.0 * M_PI);
-    if (angle < 0)
-        angle += 2.0 * M_PI;
-    return angle - M_PI;
+  last_servo_cmd_ = servo;
 }
 
-} // namespace vesc_ackermann
+void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
+{
+  last_imu_ = imu;
+}
 
-#include <rclcpp_components/register_node_macro.hpp>
+}  // namespace vesc_ackermann
+
+#include "rclcpp_components/register_node_macro.hpp"  // NOLINT
 
 RCLCPP_COMPONENTS_REGISTER_NODE(vesc_ackermann::VescToOdom)
