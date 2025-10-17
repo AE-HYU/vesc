@@ -15,6 +15,7 @@ find_package(ament_cmake_auto REQUIRED)
 # ★ Eigen3 찾기
 # eigen3_cmake_module 사용 중이건, 시스템 모듈이건 둘 다 대응
 find_package(Eigen3 REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 ament_auto_find_build_dependencies()
 
@@ -50,6 +51,7 @@ target_include_directories(${PROJECT_NAME}
 # ament가 링크/전파 처리
 ament_target_dependencies(${PROJECT_NAME}
   Eigen3
+  sensor_msgs
 )
 
 # register nodes as components

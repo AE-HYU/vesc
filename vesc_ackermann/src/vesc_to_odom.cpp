@@ -56,7 +56,9 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   publish_tf_(false),
   x_(0.0),
   y_(0.0),
-  yaw_(0.0)
+  yaw_(0.0),
+  initial_imu_yaw_(0.0),
+  imu_initialized_(false)
 {
   // get ROS parameters
   odom_frame_ = declare_parameter("odom_frame", odom_frame_);
@@ -116,11 +118,14 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
   // check that we have a last servo command if we are depending on it for angular velocity
   if (use_servo_cmd_ && !last_servo_cmd_) {
+    RCLCPP_INFO(this->get_logger(),
+      "Waiting for servo command message to calculate angular velocity.");
     return;
   }
 
   // check that we have IMU data if we are using it
   if (use_imu_ && !last_imu_) {
+    RCLCPP_INFO(this->get_logger(), "Waiting for IMU message to calculate angular velocity.");
     return;
   }
 
@@ -150,6 +155,19 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   // calc elapsed time
   auto dt = rclcpp::Time(state->header.stamp) - rclcpp::Time(last_state_->header.stamp);
 
+  // Check for abnormal dt (e.g., node restart, message dropout)
+  const double MAX_DT = 1.0;  // 1 second
+  if (dt.seconds() > MAX_DT || dt.seconds() < 0) {
+    RCLCPP_WARN(get_logger(),
+      "Abnormal dt detected: %.6f seconds. Skipping odometry update. "
+      "Current stamp: %d.%09d, Last stamp: %d.%09d",
+      dt.seconds(),
+      state->header.stamp.sec, state->header.stamp.nanosec,
+      last_state_->header.stamp.sec, last_state_->header.stamp.nanosec);
+    last_state_ = state;
+    return;
+  }
+
   /** @todo could probably do better propigating odometry, e.g. trapezoidal integration */
 
   // propigate odometry
@@ -167,15 +185,25 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
       last_imu_->orientation.w
     );
     tf2::Matrix3x3 m(q);
-    double roll, pitch;
-    m.getRPY(roll, pitch, yaw_);
+    double roll, pitch, current_imu_yaw;
+    m.getRPY(roll, pitch, current_imu_yaw);
+
+    // Initialize IMU yaw offset on first IMU data
+    if (!imu_initialized_) {
+      initial_imu_yaw_ = current_imu_yaw;
+      imu_initialized_ = true;
+      RCLCPP_INFO(get_logger(), "IMU initialized with yaw offset: %.3f rad", initial_imu_yaw_);
+    }
+
+    // Apply offset to make initial yaw = 0
+    yaw_ = current_imu_yaw - initial_imu_yaw_;
   } else {
     yaw_ += current_angular_velocity * dt.seconds();
   }
 
   // save state for next time
   last_state_ = state;
-
+ 
   // publish odometry message
   Odometry odom;
   odom.header.frame_id = odom_frame_;

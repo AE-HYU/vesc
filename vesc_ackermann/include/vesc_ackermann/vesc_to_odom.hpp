@@ -72,6 +72,10 @@ private:
   VescStateStamped::SharedPtr last_state_;  ///< Last received state message
   sensor_msgs::msg::Imu::SharedPtr last_imu_;  ///< Last received IMU message
 
+  // IMU initialization
+  double initial_imu_yaw_;  ///< Initial IMU yaw for offset calibration
+  bool imu_initialized_;    ///< Flag to check if IMU has been initialized
+
   // ROS services
   rclcpp::Publisher<Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
