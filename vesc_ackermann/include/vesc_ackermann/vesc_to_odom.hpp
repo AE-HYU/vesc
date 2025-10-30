@@ -65,6 +65,7 @@ private:
   double steering_to_servo_gain_, steering_to_servo_offset_;
   double wheelbase_;
   bool publish_tf_;
+  std::string integration_method_;  ///< Integration method: "euler", "trapezoidal", "analytical"
 
   // odometry state
   double x_, y_, yaw_;
@@ -76,8 +77,14 @@ private:
   double initial_imu_yaw_;  ///< Initial IMU yaw for offset calibration
   bool imu_initialized_;    ///< Flag to check if IMU has been initialized
 
+  // Low-pass filter for IMU angular velocity
+  double imu_angular_velocity_alpha_;  ///< Low-pass filter coefficient (0-1)
+  double filtered_angular_velocity_;   ///< Filtered angular velocity value
+  bool angular_velocity_filter_initialized_;  ///< Flag to check if filter has been initialized
+
   // ROS services
   rclcpp::Publisher<Odometry>::SharedPtr odom_pub_;
+  rclcpp::Publisher<Float64>::SharedPtr filtered_angular_velocity_pub_;
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
   rclcpp::Subscription<Float64>::SharedPtr servo_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;

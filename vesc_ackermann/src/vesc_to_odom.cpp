@@ -54,17 +54,23 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   use_servo_cmd_(true),
   use_imu_(false),
   publish_tf_(false),
+  integration_method_("euler"),
   x_(0.0),
   y_(0.0),
   yaw_(0.0),
   initial_imu_yaw_(0.0),
-  imu_initialized_(false)
+  imu_initialized_(false),
+  imu_angular_velocity_alpha_(0.3),
+  filtered_angular_velocity_(0.0),
+  angular_velocity_filter_initialized_(false)
 {
   // get ROS parameters
   odom_frame_ = declare_parameter("odom_frame", odom_frame_);
   base_frame_ = declare_parameter("base_frame", base_frame_);
   use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", use_servo_cmd_);
   use_imu_ = declare_parameter("use_imu", use_imu_);
+  integration_method_ = declare_parameter("integration_method", integration_method_);
+  imu_angular_velocity_alpha_ = declare_parameter("imu_angular_velocity_alpha", imu_angular_velocity_alpha_);
 
   declare_parameter<double>("speed_to_erpm_gain", 0.0);
   declare_parameter<double>("speed_to_erpm_offset", 0.0);
@@ -90,8 +96,26 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
       "Both use_imu and use_servo_cmd are true. IMU will be used for angular velocity and yaw.");
   }
 
+  // Validate integration method
+  if (integration_method_ != "euler" && integration_method_ != "trapezoidal" &&
+      integration_method_ != "analytical") {
+    RCLCPP_WARN(get_logger(),
+      "Invalid integration_method '%s'. Using 'euler' as default. "
+      "Valid options: 'euler', 'trapezoidal', 'analytical'",
+      integration_method_.c_str());
+    integration_method_ = "euler";
+  }
+
+  RCLCPP_INFO(get_logger(), "Using '%s' integration method for odometry",
+              integration_method_.c_str());
+
   // create odom publisher
   odom_pub_ = create_publisher<Odometry>("odom", 10);
+
+  // create filtered angular velocity publisher
+  if (use_imu_) {
+    filtered_angular_velocity_pub_ = create_publisher<Float64>("imu/filtered_angular_velocity", 10);
+  }
 
   // create tf broadcaster
   if (publish_tf_) {
@@ -138,8 +162,8 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   double current_angular_velocity = 0.0;
 
   if (use_imu_) {
-    // Use IMU yaw rate (angular velocity around z-axis)
-    current_angular_velocity = last_imu_->angular_velocity.z;
+    // Use filtered IMU yaw rate (angular velocity around z-axis)
+    current_angular_velocity = filtered_angular_velocity_;
   } else if (use_servo_cmd_) {
     // Calculate from steering angle
     double current_steering_angle =
@@ -168,13 +192,9 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     return;
   }
 
-  /** @todo could probably do better propigating odometry, e.g. trapezoidal integration */
-
-  // propigate odometry
-  double x_dot = current_speed * cos(yaw_);
-  double y_dot = current_speed * sin(yaw_);
-  x_ += x_dot * dt.seconds();
-  y_ += y_dot * dt.seconds();
+  // Update yaw first (needed for position integration)
+  double yaw_start = yaw_;
+  double yaw_end = yaw_;
 
   if (use_imu_) {
     // Extract yaw from IMU quaternion
@@ -196,9 +216,54 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
     }
 
     // Apply offset to make initial yaw = 0
-    yaw_ = current_imu_yaw - initial_imu_yaw_;
+    yaw_end = current_imu_yaw - initial_imu_yaw_;
+    yaw_ = yaw_end;
   } else {
-    yaw_ += current_angular_velocity * dt.seconds();
+    yaw_end = yaw_ + current_angular_velocity * dt.seconds();
+    yaw_ = yaw_end;
+  }
+
+  // Propagate odometry using selected integration method
+  if (integration_method_ == "trapezoidal") {
+    // Trapezoidal integration: average velocity at start and end of dt
+    double x_dot_start = current_speed * cos(yaw_start);
+    double y_dot_start = current_speed * sin(yaw_start);
+    double x_dot_end = current_speed * cos(yaw_end);
+    double y_dot_end = current_speed * sin(yaw_end);
+
+    // Use average of start and end velocities
+    x_ += 0.5 * (x_dot_start + x_dot_end) * dt.seconds();
+    y_ += 0.5 * (y_dot_start + y_dot_end) * dt.seconds();
+
+  } else if (integration_method_ == "analytical") {
+    // Analytical solution for Ackermann kinematics (circular arc)
+    double delta_yaw = yaw_end - yaw_start;
+
+    if (std::fabs(delta_yaw) < 1e-6) {
+      // Nearly straight motion: use simple forward integration
+      x_ += current_speed * cos(yaw_start) * dt.seconds();
+      y_ += current_speed * sin(yaw_start) * dt.seconds();
+    } else {
+      // Circular arc motion: exact solution for constant curvature
+      // Use actual delta_yaw to calculate turning radius (more accurate than using angular velocity)
+      double actual_angular_velocity = delta_yaw / dt.seconds();
+      double turning_radius = current_speed / actual_angular_velocity;
+
+      // Calculate displacement in vehicle frame (arc geometry)
+      double dx_vehicle = turning_radius * sin(delta_yaw);
+      double dy_vehicle = turning_radius * (1.0 - cos(delta_yaw));
+
+      // Transform to global frame using start yaw
+      x_ += dx_vehicle * cos(yaw_start) - dy_vehicle * sin(yaw_start);
+      y_ += dx_vehicle * sin(yaw_start) + dy_vehicle * cos(yaw_start);
+    }
+
+  } else {
+    // Default: Euler integration (first-order)
+    double x_dot = current_speed * cos(yaw_start);
+    double y_dot = current_speed * sin(yaw_start);
+    x_ += x_dot * dt.seconds();
+    y_ += y_dot * dt.seconds();
   }
 
   // save state for next time
@@ -260,6 +325,25 @@ void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
 void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
 {
   last_imu_ = imu;
+
+  // Apply low-pass filter to angular velocity
+  double raw_angular_velocity = imu->angular_velocity.z;
+
+  if (!angular_velocity_filter_initialized_) {
+    // Initialize filter with first value
+    filtered_angular_velocity_ = raw_angular_velocity;
+    angular_velocity_filter_initialized_ = true;
+  } else {
+    // Apply exponential moving average (low-pass filter)
+    // filtered = alpha * new + (1 - alpha) * old
+    filtered_angular_velocity_ = imu_angular_velocity_alpha_ * raw_angular_velocity +
+                                  (1.0 - imu_angular_velocity_alpha_) * filtered_angular_velocity_;
+  }
+
+  // Publish filtered angular velocity
+  Float64 filtered_msg;
+  filtered_msg.data = filtered_angular_velocity_;
+  filtered_angular_velocity_pub_->publish(filtered_msg);
 }
 
 }  // namespace vesc_ackermann
