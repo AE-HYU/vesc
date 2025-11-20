@@ -63,8 +63,13 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   servo_limit_(this, "servo", 0.0, 1.0),
   driver_mode_(MODE_INITIALIZING),
   fw_version_major_(-1),
-  fw_version_minor_(-1)
+  fw_version_minor_(-1),
+  total_packets_received_(0),
+  total_packets_requested_(0)
 {
+  // Initialize packet statistics timing
+  stats_report_time_ = now();
+  driver_start_time_ = now();
   // get vesc serial port address
   std::string port = declare_parameter<std::string>("port", "");
 
@@ -137,6 +142,9 @@ void VescDriver::timerCallback()
   if (driver_mode_ == MODE_INITIALIZING) {
     // request version number, return packet will update the internal version numbers
     vesc_.requestFWVersion();
+    packet_requests_["FWVersion"]++;
+    total_packets_requested_++;
+
     if (fw_version_major_ >= 0 && fw_version_minor_ >= 0) {
       RCLCPP_INFO(
         get_logger(), "Connected to VESC with firmware version %d.%d",
@@ -146,8 +154,13 @@ void VescDriver::timerCallback()
   } else if (driver_mode_ == MODE_OPERATING) {
     // poll for vesc state (telemetry)
     vesc_.requestState();
+    packet_requests_["Values"]++;
+    total_packets_requested_++;
+
     // poll for vesc imu
     vesc_.requestImuData();
+    packet_requests_["ImuData"]++;
+    total_packets_requested_++;
   } else {
     // unknown mode, how did that happen?
     assert(false && "unknown driver mode");
@@ -156,6 +169,51 @@ void VescDriver::timerCallback()
 
 void VescDriver::vescPacketCallback(const std::shared_ptr<VescPacket const> & packet)
 {
+  // Update packet statistics
+  std::string packet_name = packet->name();
+  packet_counts_[packet_name]++;
+  packet_last_time_[packet_name] = now();
+  total_packets_received_++;
+
+  // Report statistics every 5 seconds
+  auto current_time = now();
+  if ((current_time - stats_report_time_).seconds() >= 5.0) {
+    double uptime = (current_time - driver_start_time_).seconds();
+    double overall_loss_rate = 0.0;
+    if (total_packets_requested_ > 0) {
+      overall_loss_rate = 100.0 * (1.0 - (double)total_packets_received_ / (double)total_packets_requested_);
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "=== VESC Packet Statistics (Uptime: %.1f s) ===", uptime);
+    RCLCPP_INFO(get_logger(),
+      "Total: Requested=%lu, Received=%lu, Loss=%.2f%%",
+      total_packets_requested_, total_packets_received_, overall_loss_rate);
+
+    // Per-packet type statistics
+    for (const auto& [name, received_count] : packet_counts_) {
+      uint64_t requested_count = packet_requests_[name];
+      double time_since_last = (current_time - packet_last_time_[name]).seconds();
+      double avg_rate = received_count / uptime;
+      double loss_rate = 0.0;
+      if (requested_count > 0) {
+        loss_rate = 100.0 * (1.0 - (double)received_count / (double)requested_count);
+      }
+
+      if (loss_rate > 1.0) {
+        // Highlight significant packet loss
+        RCLCPP_WARN(get_logger(),
+          "  %s: Req=%lu Rcv=%lu (Loss=%.2f%%, %.1f Hz, last: %.3f s ago)",
+          name.c_str(), requested_count, received_count, loss_rate, avg_rate, time_since_last);
+      } else {
+        RCLCPP_INFO(get_logger(),
+          "  %s: Req=%lu Rcv=%lu (Loss=%.2f%%, %.1f Hz, last: %.3f s ago)",
+          name.c_str(), requested_count, received_count, loss_rate, avg_rate, time_since_last);
+      }
+    }
+    stats_report_time_ = current_time;
+  }
+
   if (packet->name() == "Values") {
     std::shared_ptr<VescPacketValues const> values =
       std::dynamic_pointer_cast<VescPacketValues const>(packet);

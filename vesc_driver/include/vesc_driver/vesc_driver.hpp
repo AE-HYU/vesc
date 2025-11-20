@@ -41,6 +41,7 @@
 #include <experimental/optional>
 #include <memory>
 #include <string>
+#include <map>
 
 #include "vesc_driver/vesc_interface.hpp"
 #include "vesc_driver/vesc_packet.hpp"
@@ -116,6 +117,15 @@ private:
   driver_mode_t driver_mode_;           ///< driver state machine mode (state)
   int fw_version_major_;                ///< firmware major version reported by vesc
   int fw_version_minor_;                ///< firmware minor version reported by vesc
+
+  // Packet statistics variables
+  std::map<std::string, uint64_t> packet_counts_;         ///< count of each packet type received
+  std::map<std::string, uint64_t> packet_requests_;       ///< count of each packet type requested
+  std::map<std::string, rclcpp::Time> packet_last_time_;  ///< last received time for each packet type
+  rclcpp::Time stats_report_time_;                        ///< last time statistics were reported
+  uint64_t total_packets_received_;                        ///< total packets received
+  uint64_t total_packets_requested_;                       ///< total packets requested
+  rclcpp::Time driver_start_time_;                         ///< driver start time for uptime calculation
 
   // ROS callbacks
   void brakeCallback(const Float64::SharedPtr brake);
