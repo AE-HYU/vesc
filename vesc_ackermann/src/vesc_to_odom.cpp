@@ -109,6 +109,10 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(get_logger(), "Using '%s' integration method for odometry",
               integration_method_.c_str());
 
+  // Get odometry publishing rate parameter (default: 100 Hz)
+  odom_publish_rate_ = declare_parameter("odom_publish_rate", 100.0);
+  RCLCPP_INFO(get_logger(), "Odometry publishing rate: %.1f Hz", odom_publish_rate_);
+
   // create odom publisher
   odom_pub_ = create_publisher<Odometry>("odom", 10);
 
@@ -135,21 +139,111 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       "sensors/imu/raw", 10, std::bind(&VescToOdom::imuCallback, this, _1));
   }
+
+  // Create timer for consistent odometry publishing
+  auto timer_period = std::chrono::duration<double>(1.0 / odom_publish_rate_);
+  odom_timer_ = create_wall_timer(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(timer_period),
+    std::bind(&VescToOdom::odomTimerCallback, this));
 }
 
 
 void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 {
+  // Queue the incoming VESC state data for processing by timer callback
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  vesc_state_queue_.push_back(state);
+
+  // Warn if queue is getting too large (indicates timer can't keep up)
+  if (vesc_state_queue_.size() > 50) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+      "VESC state queue size: %zu (timer may not be keeping up!)",
+      vesc_state_queue_.size());
+  }
+}
+
+void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
+{
+  last_servo_cmd_ = servo;
+}
+
+void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
+{
+  // Queue the incoming IMU data for processing by timer callback
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  imu_queue_.push_back(imu);
+
+  // Warn if queue is getting too large
+  if (imu_queue_.size() > 50) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+      "IMU queue size: %zu (timer may not be keeping up!)",
+      imu_queue_.size());
+  }
+}
+
+void VescToOdom::odomTimerCallback()
+{
+  // Get data from queues
+  VescStateStamped::SharedPtr state = nullptr;
+  sensor_msgs::msg::Imu::SharedPtr imu = nullptr;
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+
+    // Get the oldest VESC state from queue if available
+    if (!vesc_state_queue_.empty()) {
+      state = vesc_state_queue_.front();
+      vesc_state_queue_.pop_front();
+    }
+
+    // Get the oldest IMU data from queue if available
+    if (use_imu_ && !imu_queue_.empty()) {
+      imu = imu_queue_.front();
+      imu_queue_.pop_front();
+    }
+  }
+
+  // Process IMU data if available (update filter and last_imu_)
+  if (imu) {
+    last_imu_ = imu;
+
+    // Apply low-pass filter to angular velocity
+    double raw_angular_velocity = imu->angular_velocity.z;
+
+    if (!angular_velocity_filter_initialized_) {
+      // Initialize filter with first value
+      filtered_angular_velocity_ = raw_angular_velocity;
+      angular_velocity_filter_initialized_ = true;
+    } else {
+      // Apply exponential moving average (low-pass filter)
+      filtered_angular_velocity_ = imu_angular_velocity_alpha_ * raw_angular_velocity +
+                                    (1.0 - imu_angular_velocity_alpha_) * filtered_angular_velocity_;
+    }
+
+    // Publish filtered angular velocity
+    Float64 filtered_msg;
+    filtered_msg.data = filtered_angular_velocity_;
+    filtered_angular_velocity_pub_->publish(filtered_msg);
+  }
+
+  // If no new VESC state data, use previous values (assume constant velocity)
+  if (!state) {
+    if (!last_state_) {
+      // No data yet, skip this cycle
+      return;
+    }
+    // Use previous state but with current timestamp
+    state = std::make_shared<VescStateStamped>(*last_state_);
+    state->header.stamp = now();
+  }
+
   // check that we have a last servo command if we are depending on it for angular velocity
   if (use_servo_cmd_ && !last_servo_cmd_) {
-    RCLCPP_INFO(this->get_logger(),
-      "Waiting for servo command message to calculate angular velocity.");
     return;
   }
 
   // check that we have IMU data if we are using it
   if (use_imu_ && !last_imu_) {
-    RCLCPP_INFO(this->get_logger(), "Waiting for IMU message to calculate angular velocity.");
     return;
   }
 
@@ -174,9 +268,10 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   // use current state as last state if this is our first time here
   if (!last_state_) {
     last_state_ = state;
+    return;
   }
 
-  // calc elapsed time
+  // calc elapsed time using VESC timestamps (which are now synchronized to request times)
   auto dt = rclcpp::Time(state->header.stamp) - rclcpp::Time(last_state_->header.stamp);
 
   // Check for abnormal dt (e.g., node restart, message dropout)
@@ -268,11 +363,11 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 
   // save state for next time
   last_state_ = state;
- 
-  // publish odometry message
+
+  // publish odometry message with current time (timer-based timestamp for consistent intervals)
   Odometry odom;
   odom.header.frame_id = odom_frame_;
-  odom.header.stamp = state->header.stamp;
+  odom.header.stamp = now();  // Use current time for consistent publishing intervals
   odom.child_frame_id = base_frame_;
 
   // Position
@@ -284,7 +379,6 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   odom.pose.pose.orientation.w = cos(yaw_ / 2.0);
 
   // Position uncertainty
-  /** @todo Think about position uncertainty, perhaps get from parameters? */
   odom.pose.covariance[0] = 0.2;   ///< x
   odom.pose.covariance[7] = 0.2;   ///< y
   odom.pose.covariance[35] = 0.4;  ///< yaw
@@ -294,14 +388,11 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   odom.twist.twist.linear.y = 0.0;
   odom.twist.twist.angular.z = current_angular_velocity;
 
-  // Velocity uncertainty
-  /** @todo Think about velocity uncertainty */
-
   if (publish_tf_) {
     TransformStamped tf;
     tf.header.frame_id = odom_frame_;
     tf.child_frame_id = base_frame_;
-    tf.header.stamp = state->header.stamp;
+    tf.header.stamp = odom.header.stamp;
     tf.transform.translation.x = x_;
     tf.transform.translation.y = y_;
     tf.transform.translation.z = 0.0;
@@ -315,35 +406,6 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   if (rclcpp::ok()) {
     odom_pub_->publish(odom);
   }
-}
-
-void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
-{
-  last_servo_cmd_ = servo;
-}
-
-void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
-{
-  last_imu_ = imu;
-
-  // Apply low-pass filter to angular velocity
-  double raw_angular_velocity = imu->angular_velocity.z;
-
-  if (!angular_velocity_filter_initialized_) {
-    // Initialize filter with first value
-    filtered_angular_velocity_ = raw_angular_velocity;
-    angular_velocity_filter_initialized_ = true;
-  } else {
-    // Apply exponential moving average (low-pass filter)
-    // filtered = alpha * new + (1 - alpha) * old
-    filtered_angular_velocity_ = imu_angular_velocity_alpha_ * raw_angular_velocity +
-                                  (1.0 - imu_angular_velocity_alpha_) * filtered_angular_velocity_;
-  }
-
-  // Publish filtered angular velocity
-  Float64 filtered_msg;
-  filtered_msg.data = filtered_angular_velocity_;
-  filtered_angular_velocity_pub_->publish(filtered_msg);
 }
 
 }  // namespace vesc_ackermann

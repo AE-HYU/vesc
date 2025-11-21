@@ -42,6 +42,8 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <deque>
+#include <mutex>
 
 #include "vesc_driver/vesc_interface.hpp"
 #include "vesc_driver/vesc_packet.hpp"
@@ -126,6 +128,11 @@ private:
   uint64_t total_packets_received_;                        ///< total packets received
   uint64_t total_packets_requested_;                       ///< total packets requested
   rclcpp::Time driver_start_time_;                         ///< driver start time for uptime calculation
+
+  // Request timestamp queues for consistent timing
+  std::deque<rclcpp::Time> vesc_request_timestamps_;      ///< timestamps of VESC data requests
+  std::deque<rclcpp::Time> imu_request_timestamps_;       ///< timestamps of IMU data requests
+  std::mutex request_timestamps_mutex_;                    ///< mutex for timestamp queues
 
   // ROS callbacks
   void brakeCallback(const Float64::SharedPtr brake);

@@ -40,6 +40,8 @@
 
 #include <memory>
 #include <string>
+#include <deque>
+#include <mutex>
 
 namespace vesc_ackermann
 {
@@ -90,10 +92,20 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
 
+  // Timer for consistent odometry publishing
+  rclcpp::TimerBase::SharedPtr odom_timer_;
+  double odom_publish_rate_;  ///< Odometry publishing rate (Hz)
+
+  // Data queues for incoming messages
+  std::deque<VescStateStamped::SharedPtr> vesc_state_queue_;
+  std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_queue_;
+  std::mutex queue_mutex_;  ///< Mutex for thread-safe queue access
+
   // ROS callbacks
   void vescStateCallback(const VescStateStamped::SharedPtr state);
   void servoCmdCallback(const Float64::SharedPtr servo);
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu);
+  void odomTimerCallback();  ///< Timer callback for odometry calculation and publishing
 };
 
 }  // namespace vesc_ackermann

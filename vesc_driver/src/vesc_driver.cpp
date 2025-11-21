@@ -152,15 +152,38 @@ void VescDriver::timerCallback()
       driver_mode_ = MODE_OPERATING;
     }
   } else if (driver_mode_ == MODE_OPERATING) {
-    // poll for vesc state (telemetry)
-    vesc_.requestState();
-    packet_requests_["Values"]++;
-    total_packets_requested_++;
+    // Record the current time as the request timestamp
+    auto request_time = now();
 
-    // poll for vesc imu
-    vesc_.requestImuData();
-    packet_requests_["ImuData"]++;
-    total_packets_requested_++;
+    {
+      std::lock_guard<std::mutex> lock(request_timestamps_mutex_);
+
+      // poll for vesc state (telemetry) and record request timestamp
+      vesc_.requestState();
+      vesc_request_timestamps_.push_back(request_time);
+      packet_requests_["Values"]++;
+      total_packets_requested_++;
+
+      // poll for vesc imu and record request timestamp
+      vesc_.requestImuData();
+      imu_request_timestamps_.push_back(request_time);
+      packet_requests_["ImuData"]++;
+      total_packets_requested_++;
+
+      // Warn if queues are getting too large (indicates very slow responses)
+      if (vesc_request_timestamps_.size() > 100) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "VESC request timestamp queue size: %zu (responses are very slow!)",
+          vesc_request_timestamps_.size());
+      }
+      if (imu_request_timestamps_.size() > 100) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "IMU request timestamp queue size: %zu (responses are very slow!)",
+          imu_request_timestamps_.size());
+      }
+    }
   } else {
     // unknown mode, how did that happen?
     assert(false && "unknown driver mode");
@@ -218,8 +241,26 @@ void VescDriver::vescPacketCallback(const std::shared_ptr<VescPacket const> & pa
     std::shared_ptr<VescPacketValues const> values =
       std::dynamic_pointer_cast<VescPacketValues const>(packet);
 
+    // Get timestamp from request queue (use request time instead of current time)
+    rclcpp::Time stamp_to_use;
+    {
+      std::lock_guard<std::mutex> lock(request_timestamps_mutex_);
+
+      if (!vesc_request_timestamps_.empty()) {
+        // Use the oldest request timestamp (FIFO order)
+        stamp_to_use = vesc_request_timestamps_.front();
+        vesc_request_timestamps_.pop_front();
+      } else {
+        // Queue is empty - use current time as fallback
+        stamp_to_use = now();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "VESC timestamp queue empty! Using current time as fallback.");
+      }
+    }
+
     auto state_msg = VescStateStamped();
-    state_msg.header.stamp = now();
+    state_msg.header.stamp = stamp_to_use;  // Use request timestamp
 
     state_msg.state.voltage_input = values->v_in();
     state_msg.state.current_motor = values->avg_motor_current();
@@ -263,10 +304,28 @@ void VescDriver::vescPacketCallback(const std::shared_ptr<VescPacket const> & pa
     std::shared_ptr<VescPacketImu const> imuData =
       std::dynamic_pointer_cast<VescPacketImu const>(packet);
 
+    // Get timestamp from request queue (use request time instead of current time)
+    rclcpp::Time stamp_to_use;
+    {
+      std::lock_guard<std::mutex> lock(request_timestamps_mutex_);
+
+      if (!imu_request_timestamps_.empty()) {
+        // Use the oldest request timestamp (FIFO order)
+        stamp_to_use = imu_request_timestamps_.front();
+        imu_request_timestamps_.pop_front();
+      } else {
+        // Queue is empty - use current time as fallback
+        stamp_to_use = now();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "IMU timestamp queue empty! Using current time as fallback.");
+      }
+    }
+
     auto imu_msg = VescImuStamped();
     auto std_imu_msg = Imu();
-    imu_msg.header.stamp = now();
-    std_imu_msg.header.stamp = now();
+    imu_msg.header.stamp = stamp_to_use;      // Use request timestamp
+    std_imu_msg.header.stamp = stamp_to_use;  // Use request timestamp
 
     imu_msg.imu.ypr.x = imuData->roll();
     imu_msg.imu.ypr.y = imuData->pitch();
