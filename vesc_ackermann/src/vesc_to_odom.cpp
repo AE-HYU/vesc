@@ -113,6 +113,9 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   odom_publish_rate_ = declare_parameter("odom_publish_rate", 100.0);
   RCLCPP_INFO(get_logger(), "Odometry publishing rate: %.1f Hz", odom_publish_rate_);
 
+  // Maximum history size for backward correction (default: 100 entries)
+  max_history_size_ = declare_parameter("max_odom_history_size", 100);
+
   // create odom publisher
   odom_pub_ = create_publisher<Odometry>("odom", 10);
 
@@ -183,28 +186,116 @@ void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
 
 void VescToOdom::odomTimerCallback()
 {
-  // Get data from queues
-  VescStateStamped::SharedPtr state = nullptr;
-  sensor_msgs::msg::Imu::SharedPtr imu = nullptr;
-
+  // Determine how many data points we can process
+  size_t processable_count = 0;
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
 
-    // Get the oldest VESC state from queue if available
-    if (!vesc_state_queue_.empty()) {
-      state = vesc_state_queue_.front();
-      vesc_state_queue_.pop_front();
-    }
-
-    // Get the oldest IMU data from queue if available
-    if (use_imu_ && !imu_queue_.empty()) {
-      imu = imu_queue_.front();
-      imu_queue_.pop_front();
+    if (use_imu_) {
+      // Must process equal number from both queues
+      processable_count = std::min(vesc_state_queue_.size(), imu_queue_.size());
+    } else {
+      processable_count = vesc_state_queue_.size();
     }
   }
 
+  // Process all available data points (backward correction if multiple)
+  if (processable_count >= 2) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      "Backward correction: processing %zu buffered data points", processable_count);
+
+    // Find the first prediction point in history (oldest predicted entry in consecutive sequence)
+    size_t correction_start_idx = odom_history_.size();
+    for (size_t i = odom_history_.size(); i > 0; --i) {
+      if (odom_history_[i-1].was_predicted) {
+        correction_start_idx = i - 1;
+      } else {
+        // Found a non-predicted entry, stop searching
+        break;
+      }
+    }
+
+    // Restore odometry state to the point before first prediction
+    if (correction_start_idx < odom_history_.size()) {
+      const auto& restore_point = odom_history_[correction_start_idx];
+      x_ = restore_point.x;
+      y_ = restore_point.y;
+      yaw_ = restore_point.yaw;
+
+      // Clear only the number of entries we can replace with actual data
+      size_t entries_to_remove = std::min(processable_count, odom_history_.size() - correction_start_idx);
+      odom_history_.erase(
+        odom_history_.begin() + correction_start_idx,
+        odom_history_.begin() + correction_start_idx + entries_to_remove
+      );
+    }
+
+    // Process all queued data points with their actual timestamps
+    for (size_t i = 0; i < processable_count; ++i) {
+      VescStateStamped::SharedPtr state;
+      sensor_msgs::msg::Imu::SharedPtr imu;
+
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        state = vesc_state_queue_.front();
+        vesc_state_queue_.pop_front();
+
+        if (use_imu_) {
+          imu = imu_queue_.front();
+          imu_queue_.pop_front();
+        }
+      }
+
+      // Process this data point with actual sensor data
+      processDataPoint(state, imu, false);  // false = not predicted
+    }
+  } else if (processable_count == 1) {
+    // Normal case: process one data point with its timestamp
+    VescStateStamped::SharedPtr state;
+    sensor_msgs::msg::Imu::SharedPtr imu;
+
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      state = vesc_state_queue_.front();
+      vesc_state_queue_.pop_front();
+
+      if (use_imu_) {
+        imu = imu_queue_.front();
+        imu_queue_.pop_front();
+      }
+    }
+
+    processDataPoint(state, imu, false);  // false = not predicted
+  } else {
+    // No data available: prediction mode
+    if (!last_state_) {
+      // No previous data yet, skip
+      return;
+    }
+
+    // Predict one step forward based on timer interval
+    // Timestamp = last_timestamp + timer_period
+    auto dt = rclcpp::Duration::from_seconds(1.0 / odom_publish_rate_);
+    rclcpp::Time predicted_timestamp = rclcpp::Time(last_state_->header.stamp) + dt;
+
+    auto predicted_state = std::make_shared<VescStateStamped>(*last_state_);
+    predicted_state->header.stamp = predicted_timestamp;
+
+    processDataPoint(predicted_state, last_imu_, true);  // true = predicted
+  }
+
+  // Publish the current odometry (use the timestamp from the last processed data)
+  if (!odom_history_.empty()) {
+    publishOdometry(odom_history_.back().timestamp);
+  }
+}
+
+void VescToOdom::processDataPoint(const VescStateStamped::SharedPtr& state,
+                                   const sensor_msgs::msg::Imu::SharedPtr& imu,
+                                   bool is_prediction)
+{
   // Process IMU data if available (update filter and last_imu_)
-  if (imu) {
+  if (imu && !is_prediction) {
     last_imu_ = imu;
 
     // Apply low-pass filter to angular velocity
@@ -224,17 +315,6 @@ void VescToOdom::odomTimerCallback()
     Float64 filtered_msg;
     filtered_msg.data = filtered_angular_velocity_;
     filtered_angular_velocity_pub_->publish(filtered_msg);
-  }
-
-  // If no new VESC state data, use previous values (assume constant velocity)
-  if (!state) {
-    if (!last_state_) {
-      // No data yet, skip this cycle
-      return;
-    }
-    // Use previous state but with current timestamp
-    state = std::make_shared<VescStateStamped>(*last_state_);
-    state->header.stamp = now();
   }
 
   // check that we have a last servo command if we are depending on it for angular velocity
@@ -318,56 +398,46 @@ void VescToOdom::odomTimerCallback()
     yaw_ = yaw_end;
   }
 
-  // Propagate odometry using selected integration method
-  if (integration_method_ == "trapezoidal") {
-    // Trapezoidal integration: average velocity at start and end of dt
-    double x_dot_start = current_speed * cos(yaw_start);
-    double y_dot_start = current_speed * sin(yaw_start);
-    double x_dot_end = current_speed * cos(yaw_end);
-    double y_dot_end = current_speed * sin(yaw_end);
+  // Integrate odometry
+  integrateOdometry(current_speed, current_angular_velocity, dt.seconds(), yaw_start, yaw_end);
 
-    // Use average of start and end velocities
-    x_ += 0.5 * (x_dot_start + x_dot_end) * dt.seconds();
-    y_ += 0.5 * (y_dot_start + y_dot_end) * dt.seconds();
-
-  } else if (integration_method_ == "analytical") {
-    // Analytical solution for Ackermann kinematics (circular arc)
-    double delta_yaw = yaw_end - yaw_start;
-
-    if (std::fabs(delta_yaw) < 1e-6) {
-      // Nearly straight motion: use simple forward integration
-      x_ += current_speed * cos(yaw_start) * dt.seconds();
-      y_ += current_speed * sin(yaw_start) * dt.seconds();
-    } else {
-      // Circular arc motion: exact solution for constant curvature
-      // Use actual delta_yaw to calculate turning radius (more accurate than using angular velocity)
-      double actual_angular_velocity = delta_yaw / dt.seconds();
-      double turning_radius = current_speed / actual_angular_velocity;
-
-      // Calculate displacement in vehicle frame (arc geometry)
-      double dx_vehicle = turning_radius * sin(delta_yaw);
-      double dy_vehicle = turning_radius * (1.0 - cos(delta_yaw));
-
-      // Transform to global frame using start yaw
-      x_ += dx_vehicle * cos(yaw_start) - dy_vehicle * sin(yaw_start);
-      y_ += dx_vehicle * sin(yaw_start) + dy_vehicle * cos(yaw_start);
-    }
-
-  } else {
-    // Default: Euler integration (first-order)
-    double x_dot = current_speed * cos(yaw_start);
-    double y_dot = current_speed * sin(yaw_start);
-    x_ += x_dot * dt.seconds();
-    y_ += y_dot * dt.seconds();
-  }
-
-  // save state for next time
+  // Save state for next time
   last_state_ = state;
 
-  // publish odometry message with current time (timer-based timestamp for consistent intervals)
+  // Add to history
+  OdomHistoryEntry entry;
+  entry.timestamp = rclcpp::Time(state->header.stamp);
+  entry.x = x_;
+  entry.y = y_;
+  entry.yaw = yaw_;
+  entry.speed = current_speed;
+  entry.angular_velocity = current_angular_velocity;
+  entry.was_predicted = is_prediction;
+
+  odom_history_.push_back(entry);
+
+  // Limit history size
+  while (odom_history_.size() > max_history_size_) {
+    odom_history_.pop_front();
+  }
+}
+
+void VescToOdom::publishOdometry(const rclcpp::Time& current_time)
+{
+  // Get current velocity from last processed data
+  double current_speed = 0.0;
+  double current_angular_velocity = 0.0;
+
+  if (!odom_history_.empty()) {
+    const auto& last_entry = odom_history_.back();
+    current_speed = last_entry.speed;
+    current_angular_velocity = last_entry.angular_velocity;
+  }
+
+  // Publish odometry message
   Odometry odom;
   odom.header.frame_id = odom_frame_;
-  odom.header.stamp = now();  // Use current time for consistent publishing intervals
+  odom.header.stamp = current_time;
   odom.child_frame_id = base_frame_;
 
   // Position
@@ -405,6 +475,53 @@ void VescToOdom::odomTimerCallback()
 
   if (rclcpp::ok()) {
     odom_pub_->publish(odom);
+  }
+}
+
+void VescToOdom::integrateOdometry(double current_speed, double current_angular_velocity,
+                                    double dt, double yaw_start, double yaw_end)
+{
+  // Propagate odometry using selected integration method
+  if (integration_method_ == "trapezoidal") {
+    // Trapezoidal integration: average velocity at start and end of dt
+    double x_dot_start = current_speed * cos(yaw_start);
+    double y_dot_start = current_speed * sin(yaw_start);
+    double x_dot_end = current_speed * cos(yaw_end);
+    double y_dot_end = current_speed * sin(yaw_end);
+
+    // Use average of start and end velocities
+    x_ += 0.5 * (x_dot_start + x_dot_end) * dt;
+    y_ += 0.5 * (y_dot_start + y_dot_end) * dt;
+
+  } else if (integration_method_ == "analytical") {
+    // Analytical solution for Ackermann kinematics (circular arc)
+    double delta_yaw = yaw_end - yaw_start;
+
+    if (std::fabs(delta_yaw) < 1e-6) {
+      // Nearly straight motion: use simple forward integration
+      x_ += current_speed * cos(yaw_start) * dt;
+      y_ += current_speed * sin(yaw_start) * dt;
+    } else {
+      // Circular arc motion: exact solution for constant curvature
+      // Use actual delta_yaw to calculate turning radius (more accurate than using angular velocity)
+      double actual_angular_velocity = delta_yaw / dt;
+      double turning_radius = current_speed / actual_angular_velocity;
+
+      // Calculate displacement in vehicle frame (arc geometry)
+      double dx_vehicle = turning_radius * sin(delta_yaw);
+      double dy_vehicle = turning_radius * (1.0 - cos(delta_yaw));
+
+      // Transform to global frame using start yaw
+      x_ += dx_vehicle * cos(yaw_start) - dy_vehicle * sin(yaw_start);
+      y_ += dx_vehicle * sin(yaw_start) + dy_vehicle * cos(yaw_start);
+    }
+
+  } else {
+    // Default: Euler integration (first-order)
+    double x_dot = current_speed * cos(yaw_start);
+    double y_dot = current_speed * sin(yaw_start);
+    x_ += x_dot * dt;
+    y_ += y_dot * dt;
   }
 }
 

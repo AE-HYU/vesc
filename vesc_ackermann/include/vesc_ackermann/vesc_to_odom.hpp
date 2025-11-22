@@ -101,11 +101,30 @@ private:
   std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_queue_;
   std::mutex queue_mutex_;  ///< Mutex for thread-safe queue access
 
+  // Odometry history for backward correction
+  struct OdomHistoryEntry {
+    rclcpp::Time timestamp;
+    double x, y, yaw;
+    double speed;
+    double angular_velocity;
+    bool was_predicted;
+  };
+  std::deque<OdomHistoryEntry> odom_history_;
+  size_t max_history_size_;  ///< Maximum number of history entries to keep
+
   // ROS callbacks
   void vescStateCallback(const VescStateStamped::SharedPtr state);
   void servoCmdCallback(const Float64::SharedPtr servo);
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu);
   void odomTimerCallback();  ///< Timer callback for odometry calculation and publishing
+
+  // Helper methods
+  void processDataPoint(const VescStateStamped::SharedPtr& state,
+                        const sensor_msgs::msg::Imu::SharedPtr& imu,
+                        bool is_prediction);
+  void publishOdometry(const rclcpp::Time& current_time);
+  void integrateOdometry(double current_speed, double current_angular_velocity,
+                         double dt, double yaw_start, double yaw_end);
 };
 
 }  // namespace vesc_ackermann
