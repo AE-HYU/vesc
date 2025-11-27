@@ -286,6 +286,21 @@ void VescToOdom::odomTimerCallback()
         }
       }
 
+      // Verify timestamp ordering before processing
+      if (last_state_) {
+        rclcpp::Time current_time(state->header.stamp);
+        rclcpp::Time last_time(last_state_->header.stamp);
+
+        if (current_time <= last_time) {
+          RCLCPP_WARN(get_logger(),
+            "Skipping out-of-order data during backward correction! "
+            "Current: %.9f s, Last: %.9f s (diff: %.6f ms)",
+            current_time.seconds(), last_time.seconds(),
+            (current_time - last_time).seconds() * 1000.0);
+          continue;  // Skip this out-of-order data point
+        }
+      }
+
       processDataPoint(state, imu, false);  // false = not predicted
     }
   } else if (processable_count == 1) {
@@ -318,6 +333,20 @@ void VescToOdom::odomTimerCallback()
       vesc_state_queue_.pop_front();
       if (use_imu_) {
         imu_queue_.pop_front();
+      }
+    }
+
+    // Verify timestamp ordering before processing
+    if (last_state_) {
+      rclcpp::Time current_time(state->header.stamp);
+      rclcpp::Time last_time(last_state_->header.stamp);
+
+      if (current_time <= last_time) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "Skipping out-of-order data! Current: %.9f s, Last: %.9f s (diff: %.6f ms)",
+          current_time.seconds(), last_time.seconds(),
+          (current_time - last_time).seconds() * 1000.0);
+        return;  // Skip this cycle
       }
     }
 
