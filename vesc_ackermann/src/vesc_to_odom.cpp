@@ -201,8 +201,8 @@ void VescToOdom::odomTimerCallback()
 
   // Process all available data points (backward correction if multiple)
   if (processable_count >= 2) {
-    RCLCPP_INFO(get_logger(),
-      "=== Backward correction START: %zu buffered data points ===", processable_count);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      "Backward correction: %zu buffered data points", processable_count);
 
     // Find the first prediction point in history (oldest predicted entry in consecutive sequence)
     size_t correction_start_idx = odom_history_.size();
@@ -215,19 +215,10 @@ void VescToOdom::odomTimerCallback()
       }
     }
 
-    RCLCPP_INFO(get_logger(),
-      "History size: %zu, correction_start_idx: %zu, predictions to replace: %zu",
-      odom_history_.size(), correction_start_idx,
-      correction_start_idx < odom_history_.size() ? odom_history_.size() - correction_start_idx : 0);
-
     // Restore odometry state from history to the point before first prediction
     if (correction_start_idx > 0) {
       // Restore from the last non-predicted entry (entry just before predictions started)
       const auto& restore_point = odom_history_[correction_start_idx - 1];
-
-      RCLCPP_INFO(get_logger(),
-        "Restoring to last real data: timestamp=%.9f s, x=%.3f, y=%.3f, yaw=%.3f",
-        restore_point.timestamp.seconds(), restore_point.x, restore_point.y, restore_point.yaw);
 
       // Restore odometry position and orientation
       x_ = restore_point.x;
@@ -244,10 +235,6 @@ void VescToOdom::odomTimerCallback()
         odom_history_.begin() + correction_start_idx,
         odom_history_.begin() + correction_start_idx + entries_to_remove
       );
-
-      RCLCPP_INFO(get_logger(),
-        "Cleared %zu predicted entries from history. New history size: %zu",
-        entries_to_remove, odom_history_.size());
     } else {
       // All history is predicted or empty - shouldn't happen normally
       RCLCPP_WARN(get_logger(),
@@ -255,19 +242,43 @@ void VescToOdom::odomTimerCallback()
         correction_start_idx, odom_history_.size());
     }
 
-    // Log queue timestamps before processing
-    {
+    // Synchronize queues by removing mismatched entries from the front
+    if (use_imu_) {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      RCLCPP_INFO(get_logger(), "Queue timestamps:");
-      for (size_t i = 0; i < std::min(processable_count, vesc_state_queue_.size()); ++i) {
-        double vesc_t = rclcpp::Time(vesc_state_queue_[i]->header.stamp).seconds();
-        if (use_imu_ && i < imu_queue_.size()) {
-          double imu_t = rclcpp::Time(imu_queue_[i]->header.stamp).seconds();
-          RCLCPP_INFO(get_logger(), "  [%zu] VESC: %.9f s, IMU: %.9f s", i, vesc_t, imu_t);
+
+      // Check if queues are synchronized at the front
+      while (!vesc_state_queue_.empty() && !imu_queue_.empty()) {
+        rclcpp::Time vesc_time(vesc_state_queue_.front()->header.stamp);
+        rclcpp::Time imu_time(imu_queue_.front()->header.stamp);
+        double time_diff = (vesc_time - imu_time).seconds();
+
+        if (std::abs(time_diff) < 1e-6) {
+          // Synchronized! Stop checking
+          break;
+        } else if (time_diff > 0) {
+          // VESC is ahead, IMU is behind - discard old IMU data
+          RCLCPP_WARN(get_logger(),
+            "Queue sync: IMU behind by %.6f ms. Discarding IMU timestamp %.9f s",
+            time_diff * 1000.0, imu_time.seconds());
+          imu_queue_.pop_front();
         } else {
-          RCLCPP_INFO(get_logger(), "  [%zu] VESC: %.9f s", i, vesc_t);
+          // IMU is ahead, VESC is behind - discard old VESC data
+          RCLCPP_WARN(get_logger(),
+            "Queue sync: VESC behind by %.6f ms. Discarding VESC timestamp %.9f s",
+            -time_diff * 1000.0, vesc_time.seconds());
+          vesc_state_queue_.pop_front();
         }
       }
+
+      // Recalculate processable_count after synchronization
+      processable_count = std::min(vesc_state_queue_.size(), imu_queue_.size());
+
+      if (processable_count == 0) {
+        RCLCPP_WARN(get_logger(), "No synchronized data available after queue sync");
+        return;
+      }
+
+      RCLCPP_INFO(get_logger(), "After sync: %zu processable pairs", processable_count);
     }
 
     // Process all queued data points with timestamp verification
@@ -284,6 +295,7 @@ void VescToOdom::odomTimerCallback()
         }
 
         state = vesc_state_queue_.front();
+        vesc_state_queue_.pop_front();
 
         if (use_imu_) {
           if (imu_queue_.empty()) {
@@ -292,24 +304,6 @@ void VescToOdom::odomTimerCallback()
           }
 
           imu = imu_queue_.front();
-
-          // Verify timestamp synchronization
-          rclcpp::Time vesc_time(state->header.stamp);
-          rclcpp::Time imu_time(imu->header.stamp);
-          double time_diff = std::abs((vesc_time - imu_time).seconds());
-
-          if (time_diff > 1e-6) {  // 1 microsecond tolerance
-            RCLCPP_ERROR(get_logger(),
-              "[%zu/%zu] CRITICAL: Timestamp mismatch! VESC: %.9f s, IMU: %.9f s (diff: %.6f ms). "
-              "Skipping odometry update.",
-              i+1, processable_count, vesc_time.seconds(), imu_time.seconds(), time_diff * 1000.0);
-            return;  // Skip processing to maintain data integrity
-          }
-        }
-
-        // Pop from queues
-        vesc_state_queue_.pop_front();
-        if (use_imu_) {
           imu_queue_.pop_front();
         }
       }
@@ -319,16 +313,11 @@ void VescToOdom::odomTimerCallback()
         rclcpp::Time current_time(state->header.stamp);
         rclcpp::Time last_time(last_state_->header.stamp);
 
-        RCLCPP_INFO(get_logger(),
-          "[%zu/%zu] Processing: current_timestamp=%.9f s, last_timestamp=%.9f s, dt=%.6f ms",
-          i+1, processable_count, current_time.seconds(), last_time.seconds(),
-          (current_time - last_time).seconds() * 1000.0);
-
         if (current_time <= last_time) {
           RCLCPP_WARN(get_logger(),
-            "[%zu/%zu] Skipping out-of-order data during backward correction! "
+            "Skipping out-of-order data during backward correction! "
             "Current: %.9f s, Last: %.9f s (diff: %.6f ms)",
-            i+1, processable_count, current_time.seconds(), last_time.seconds(),
+            current_time.seconds(), last_time.seconds(),
             (current_time - last_time).seconds() * 1000.0);
           continue;  // Skip this out-of-order data point
         }
@@ -336,8 +325,6 @@ void VescToOdom::odomTimerCallback()
 
       processDataPoint(state, imu, false);  // false = not predicted
     }
-
-    RCLCPP_INFO(get_logger(), "=== Backward correction END ===");
   } else if (processable_count == 1) {
     // Normal case: process one data point
     VescStateStamped::SharedPtr state;
