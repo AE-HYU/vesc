@@ -333,27 +333,42 @@ void VescToOdom::odomTimerCallback()
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
 
-      state = vesc_state_queue_.front();
-
+      // Synchronize queues before processing single data point
       if (use_imu_) {
-        imu = imu_queue_.front();
+        while (!vesc_state_queue_.empty() && !imu_queue_.empty()) {
+          rclcpp::Time vesc_time(vesc_state_queue_.front()->header.stamp);
+          rclcpp::Time imu_time(imu_queue_.front()->header.stamp);
+          double time_diff = (vesc_time - imu_time).seconds();
 
-        // Verify timestamp synchronization
-        rclcpp::Time vesc_time(state->header.stamp);
-        rclcpp::Time imu_time(imu->header.stamp);
-        double time_diff = std::abs((vesc_time - imu_time).seconds());
+          if (std::abs(time_diff) < 1e-6) {
+            // Synchronized!
+            break;
+          } else if (time_diff > 0) {
+            // VESC is ahead, discard old IMU data
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+              "Single data sync: IMU behind by %.6f ms. Discarding.",
+              time_diff * 1000.0);
+            imu_queue_.pop_front();
+          } else {
+            // IMU is ahead, discard old VESC data
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+              "Single data sync: VESC behind by %.6f ms. Discarding.",
+              -time_diff * 1000.0);
+            vesc_state_queue_.pop_front();
+          }
+        }
 
-        if (time_diff > 1e-6) {
-          RCLCPP_ERROR(get_logger(),
-            "CRITICAL: Timestamp mismatch! VESC: %.6f s, IMU: %.6f s (diff: %.3f ms). "
-            "Skipping odometry update.",
-            vesc_time.seconds(), imu_time.seconds(), time_diff * 1000.0);
-          return;
+        // Check if we still have data after sync
+        if (vesc_state_queue_.empty() || imu_queue_.empty()) {
+          return;  // No synchronized data available
         }
       }
 
+      state = vesc_state_queue_.front();
       vesc_state_queue_.pop_front();
+
       if (use_imu_) {
+        imu = imu_queue_.front();
         imu_queue_.pop_front();
       }
     }
