@@ -215,52 +215,108 @@ void VescToOdom::odomTimerCallback()
       }
     }
 
-    // Restore odometry state to the point before first prediction
-    if (correction_start_idx < odom_history_.size()) {
-      const auto& restore_point = odom_history_[correction_start_idx];
+    // Restore odometry state from history to the point before first prediction
+    if (correction_start_idx > 0) {
+      // Restore from the last non-predicted entry (entry just before predictions started)
+      const auto& restore_point = odom_history_[correction_start_idx - 1];
+
+      // Restore odometry position and orientation
       x_ = restore_point.x;
       y_ = restore_point.y;
       yaw_ = restore_point.yaw;
 
-      // Clear only the number of entries we can replace with actual data
+      // Restore last_state_ with timestamp for dt calculation
+      last_state_ = std::make_shared<VescStateStamped>();
+      last_state_->header.stamp = restore_point.timestamp;
+
+      // Clear predicted entries that will be replaced with actual data
       size_t entries_to_remove = std::min(processable_count, odom_history_.size() - correction_start_idx);
       odom_history_.erase(
         odom_history_.begin() + correction_start_idx,
         odom_history_.begin() + correction_start_idx + entries_to_remove
       );
+    } else {
+      // All history is predicted or empty - shouldn't happen normally
+      RCLCPP_WARN(get_logger(),
+        "Backward correction: no valid restoration point (correction_start_idx=%zu, history_size=%zu)",
+        correction_start_idx, odom_history_.size());
     }
 
-    // Process all queued data points with their actual timestamps
+    // Process all queued data points with timestamp verification
     for (size_t i = 0; i < processable_count; ++i) {
       VescStateStamped::SharedPtr state;
       sensor_msgs::msg::Imu::SharedPtr imu;
 
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        if (vesc_state_queue_.empty()) {
+          RCLCPP_WARN(get_logger(), "VESC queue empty during backward correction");
+          break;
+        }
+
         state = vesc_state_queue_.front();
-        vesc_state_queue_.pop_front();
 
         if (use_imu_) {
+          if (imu_queue_.empty()) {
+            RCLCPP_WARN(get_logger(), "IMU queue empty during backward correction");
+            break;
+          }
+
           imu = imu_queue_.front();
+
+          // Verify timestamp synchronization
+          rclcpp::Time vesc_time(state->header.stamp);
+          rclcpp::Time imu_time(imu->header.stamp);
+          double time_diff = std::abs((vesc_time - imu_time).seconds());
+
+          if (time_diff > 1e-6) {  // 1 microsecond tolerance
+            RCLCPP_ERROR(get_logger(),
+              "CRITICAL: Timestamp mismatch! VESC: %.6f s, IMU: %.6f s (diff: %.3f ms). "
+              "Skipping odometry update.",
+              vesc_time.seconds(), imu_time.seconds(), time_diff * 1000.0);
+            return;  // Skip processing to maintain data integrity
+          }
+        }
+
+        // Pop from queues
+        vesc_state_queue_.pop_front();
+        if (use_imu_) {
           imu_queue_.pop_front();
         }
       }
 
-      // Process this data point with actual sensor data
       processDataPoint(state, imu, false);  // false = not predicted
     }
   } else if (processable_count == 1) {
-    // Normal case: process one data point with its timestamp
+    // Normal case: process one data point
     VescStateStamped::SharedPtr state;
     sensor_msgs::msg::Imu::SharedPtr imu;
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
+
       state = vesc_state_queue_.front();
-      vesc_state_queue_.pop_front();
 
       if (use_imu_) {
         imu = imu_queue_.front();
+
+        // Verify timestamp synchronization
+        rclcpp::Time vesc_time(state->header.stamp);
+        rclcpp::Time imu_time(imu->header.stamp);
+        double time_diff = std::abs((vesc_time - imu_time).seconds());
+
+        if (time_diff > 1e-6) {
+          RCLCPP_ERROR(get_logger(),
+            "CRITICAL: Timestamp mismatch! VESC: %.6f s, IMU: %.6f s (diff: %.3f ms). "
+            "Skipping odometry update.",
+            vesc_time.seconds(), imu_time.seconds(), time_diff * 1000.0);
+          return;
+        }
+      }
+
+      vesc_state_queue_.pop_front();
+      if (use_imu_) {
         imu_queue_.pop_front();
       }
     }
